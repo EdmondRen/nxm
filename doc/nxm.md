@@ -68,7 +68,7 @@ W\bigl[\mathbf x-A(\mathbf s_0+\mathbf B \mathbf z)\bigr]
 $$
 This is almost the same with a multi-template matched filter case with two differencies. There is an additional term, whichis the regularization induced by the PCA prior. Plus, model parameters are no longer quadratic.
 
-Unlike the simple multi-template matched filter, there is no analytical solution to all model parameters $(A,\mathbf z)$. If an amplitude $\mathrm A$ is given, there is the exact conditional solution for z:
+Unlike the simple multi-template matched filter, there is no analytical solution to all model parameters $(A,\mathbf z)$. If an amplitude $\mathrm A$ is given, there is the exact conditional solution for $\mathbf z$:
 
 $$
 \boxed{
@@ -78,6 +78,36 @@ A \mathbf{B}^TW(\mathbf x-A\mathbf s_0).
 }
 $$
 
-### 1.3 
+### 1.3 Pulse start time
+
+The above derivation assumes that templates and pulse data are aligned in time. But in reality we don't know the truth starting time. So the relative pulse start time $t_0$ is another parameters that need to be specified in solution for $\mathbf z$:
+
+$$
+\boxed{
+\widehat{\mathbf z}(A, t_0)
+=\left(A^2\mathbf{B_{t_0}}^TW\mathbf{B_{t_0}}+C^{-1}\right)^{-1}
+A \mathbf{B_{t_0}}^TW(\mathbf x-A\mathbf s_0).
+}
+$$
+
+in which $\mathbf{B_{t_0}}$ means shifting each template by $t_0$ in time domain.
+
+
+## 2. Multi-channel, multi-template 
+
+### Consider noise correlation
+
+
+## 3. Procedure
+
+Although we wrote our derivation in time domain, it would be more convenient for calculation in frequency domain. 
+
+### 3.1 Template generation
+
+### 3.2 Noise CSD generation
+
+### 3.3 Finding initial value of time offset and amplitudes for each channel
+
+### 3.4 Joint fit 
 
 
