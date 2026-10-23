@@ -1,113 +1,217 @@
 # Multi-channel, multi-template event reconstruction
 
-In a multi-channel cryogenic particle detector based on TES sensor, there are usually two challenges. First, pulse shape varies. Second, there is noise correlation between channels. We develope a event reconstruction workflow to adress these two issues. 
+TES pulse shapes vary with event position and energy partition, while detector noise is correlated across channels. This workflow models scale-invariant pulse-shape variation with principal components and handles channel correlations with the full noise cross-spectral density (CSD).
 
-## 1. Single-channel, multi-template event reconstruction
+## 1. Single-channel, multi-template reconstruction
 
-We first deal with pulse shape variation in a single channel. Even for monoenergetic event, the pulse shape in one TES channel could vary based on the location of that event. Instead of using a multi-falltime analytical fit, we want to use a multi-template matched filter for the robustness near threshold.
+We first deal with pulse shape variation in a single channel by using a multi-template matched filter. The advantage over an analytical pulse shape fit is the robustness around threshold. Multi-template matched filter is well described in textbooks and we will skip the introduction. However, simply using PCA components as templates will give the wrong reconstruction. Cares must be taken in modeling the pulse and generating templates.
 
-Multi-template matched filter is well described in many textbooks and we will skip the introduction. However, simply using PCA components as templates will give the wrong reconstruction. Cares must be taken in modeling the pulse and generating templates.
+We made the following assumptions to simplify the problem:
+1. Pulse shape fluctuation is scale invariant. We ignore the detector saturation effect for now.
+2. Noise is stationary but can be colored.
 
-### 1.1 Model pulse using PCA components
 
-Let $\mathbf{x}\in\mathbb R^M$ be a sampled pulse, and let the additive detector noise have zero mean and positive-definite covariance $N$. Define $W=N^{-1}$.
+### 1.1 Pulse model from PCA
 
-A physically useful model for approximately **scale-invariant** shape fluctuations is
+Let $\mathbf x\in\mathbb R^M$ be a baseline-subtracted pulse. The additive noise $\boldsymbol\epsilon$ has zero mean and covariance $N$, with $W=N^{-1}$. For approximately scale-invariant shape fluctuations, model the pulse as
 
 $$
-\boxed{
-\mathbf x(A,c_1,\ldots, c_k)=A\left(\mathbf s_0+
-\sum_k c_k\mathbf s_k\right)
-+\boldsymbol\epsilon, \qquad  c_k\sim\mathcal N(0,\lambda_k)
-}
+\mathbf x
+=A\left(\mathbf s_0+\sum_{k=1}^{K}c_k\mathbf s_k\right)
++\boldsymbol\epsilon,
+\qquad c_k\sim\mathcal N(0,\lambda_k),
 $$
 
+where $\mathbf s_0$ is the mean unit-amplitude pulse, $A$ is its amplitude, $\mathbf s_k$ is the $k$-th unit-norm PCA direction, and $\lambda_k$ is its explained variance. Define standardized coefficients and a variance-scaled template matrix by
 
-where:
-- $\mathbf s_0$ is the mean pulse template.
-- $A$ is the overall pulse amplitude.
-- $\mathbf s_k$ is the $k$-th PCA direction, from $\texttt{pca.components\_[k]}$. The PCA directions satisfy $\|\mathbf s_k\|_2=1.$
-- $\lambda_k$ is the variance from $\texttt{pca.explained\_variance\_[k]}$.
-- $c_k$ is the fitted coefficient for that direction.
-- $\boldsymbol\epsilon$ is measurement noise.
-
-
-For numerical stability, we can parameterize the fit coefficients  $c_k$ as
 $$
 c_k=\sqrt{\lambda_k}\,z_k,
-\qquad z_k\sim\mathcal N(0,1).
+\qquad z_k\sim\mathcal N(0,1),
+\qquad
+\mathbf B=\left(\sqrt{\lambda_1}\mathbf s_1,\ldots,
+\sqrt{\lambda_K}\mathbf s_K\right).
 $$
 
-and define the template matrix
-$$
-\mathbf B=\mathbf (\mathbf s_1\sqrt{\lambda_1},\ldots,\mathbf s_k \sqrt{\lambda_k}).
-$$
-
-The model can be written as
+The model becomes
 
 $$
 \boxed{
-\mathbf x(A,\mathbf z)=A\left(\mathbf s_0+
-\mathbf B \mathbf z\right)
-+\boldsymbol\epsilon, \qquad  z_k\sim\mathcal N(0,1)
+\mathbf x(A,\mathbf z)
+=A\left(\mathbf s_0+\mathbf B\mathbf z\right)
++\boldsymbol\epsilon,
+\qquad \mathbf z\sim\mathcal N(\mathbf 0,I_K).
 }
 $$
 
+PCA must therefore be applied to amplitude-normalized residuals, not directly to unnormalized pulses. Otherwise the leading components mostly reproduce amplitude variation.
 
-### 1.2. MAP objective and solution
+### 1.2 MAP objective
 
-The negative twice log posterior is
+The negative twice log posterior, up to a constant, is
 
 $$
-\boxed{
 Q(A,\mathbf z)
-=\bigl[\mathbf x-A(\mathbf s_0+\mathbf B \mathbf z)\bigr]^T
-W\bigl[\mathbf x-A(\mathbf s_0+\mathbf B \mathbf z)\bigr]
+=\left[\mathbf x-A(\mathbf s_0+\mathbf B\mathbf z)\right]^T
+W\left[\mathbf x-A(\mathbf s_0+\mathbf B\mathbf z)\right]
 +\mathbf z^T\mathbf z.
-}
 $$
-This is almost the same with a multi-template matched filter case with two differencies. There is an additional term, whichis the regularization induced by the PCA prior. Plus, model parameters are no longer quadratic.
 
-Unlike the simple multi-template matched filter, there is no analytical solution to all model parameters $(A,\mathbf z)$. If an amplitude $\mathrm A$ is given, there is the exact conditional solution for $\mathbf z$:
+The last term is the PCA prior. It prevents weakly constrained shape components from absorbing noise. The product $A\mathbf z$ makes the full problem nonlinear, thus there is no analytic solution for both A and $\mathbf z$. But for fixed $A$ the conditional solution is analytic:
 
 $$
-\boxed{
 \widehat{\mathbf z}(A)
-=\left(A^2\mathbf{B}^TW\mathbf{B}+C^{-1}\right)^{-1}
-A \mathbf{B}^TW(\mathbf x-A\mathbf s_0).
-}
+=\left(A^2\mathbf B^TW\mathbf B+I_K\right)^{-1}
+A\mathbf B^TW(\mathbf x-A\mathbf s_0).
 $$
 
 ### 1.3 Pulse start time
 
-The above derivation assumes that templates and pulse data are aligned in time. But in reality we don't know the truth starting time. So the relative pulse start time $t_0$ is another parameters that need to be specified in solution for $\mathbf z$:
+The above derivation assumes that templates and pulse data are already aligned in time. But in reality we don't know the pulse starting time.
+
+Let $\mathbf s_0(t_0)$ and $\mathbf B(t_0)$ denote the mean and PCA templates shifted by $t_0$. Both terms must receive the same shift. Then the conditional solution is
 
 $$
 \boxed{
-\widehat{\mathbf z}(A, t_0)
-=\left(A^2\mathbf{B_{t_0}}^TW\mathbf{B_{t_0}}+C^{-1}\right)^{-1}
-A \mathbf{B_{t_0}}^TW(\mathbf x-A\mathbf s_0).
+\widehat{\mathbf z}(A,t_0)
+=\left[A^2\mathbf B(t_0)^TW\mathbf B(t_0)+I_K\right]^{-1}
+A\mathbf B(t_0)^TW
+\left[\mathbf x-A\mathbf s_0(t_0)\right].
 }
 $$
 
-in which $\mathbf{B_{t_0}}$ means shifting each template by $t_0$ in time domain.
+Substitution gives the profiled objective
 
+$$
+Q_{\mathrm{prof}}(A,t_0)
+=Q\!\left(A,t_0,\widehat{\mathbf z}(A,t_0)\right),
+$$
 
-## 2. Multi-channel, multi-template 
+which is minimized numerically over $A\geq0$ and an allowed interval in $t_0$.
 
-### Consider noise correlation
+## 2. Multi-channel, multi-template reconstruction
 
+### 2.1 Joint time-domain model
 
-## 3. Procedure
+For $J$ channels, let channel $j$ have data $\mathbf x_j$, amplitude $A_j\geq0$, delay $t_j$, mean template $\mathbf s_{0,j}$, PCA matrix $\mathbf B_j$, and standardized coefficients $\mathbf z_j$. Stack the channel data and coefficients as
 
-Although we wrote our derivation in time domain, it would be more convenient for calculation in frequency domain. 
+$$
+\mathbf x=
+\begin{pmatrix}\mathbf x_1\\ \vdots\\ \mathbf x_J\end{pmatrix},
+\qquad
+\mathbf z=
+\begin{pmatrix}\mathbf z_1\\ \vdots\\ \mathbf z_J\end{pmatrix}.
+$$
+
+Define
+
+$$
+\boldsymbol\mu(\mathbf A,\mathbf t)=
+\begin{pmatrix}
+A_1\mathbf s_{0,1}(t_1)\\ \vdots\\
+A_J\mathbf s_{0,J}(t_J)
+\end{pmatrix},
+\qquad
+D(\mathbf A,\mathbf t)=
+\operatorname{blockdiag}\!\left[
+A_1\mathbf B_1(t_1),\ldots,A_J\mathbf B_J(t_J)
+\right].
+$$
+
+The full noise covariance $N\in\mathbb R^{JM\times JM}$ contains both within-channel and cross-channel covariance. With $W=N^{-1}$ and independent standard-normal PCA priors, the joint objective is
+
+$$
+Q(\mathbf A,\mathbf t,\mathbf z)
+=\left(\mathbf x-\boldsymbol\mu-D\mathbf z\right)^T
+W\left(\mathbf x-\boldsymbol\mu-D\mathbf z\right)
++\mathbf z^T\mathbf z.
+$$
+
+For fixed $\mathbf A$ and $\mathbf t$,
+
+$$
+\boxed{
+\widehat{\mathbf z}
+=\left(D^TWD+I_{JK}\right)^{-1}
+D^TW\left(\mathbf x-\boldsymbol\mu\right).
+}
+$$
+
+The prior treats shape variation in each channel independently. Off-diagonal blocks of $W$ still couple the fitted channels through their correlated noise.
+
+### 2.2 Frequency-domain form
+
+For stationary noise, evaluate the objective efficiently in the frequency domain. At frequency bin $f_l$, collect the channel Fourier coefficients in $\widetilde{\mathbf x}_l\in\mathbb C^J$ and let $S_l$ be the $J\times J$ noise CSD matrix. A delay is applied through
+
+$$
+\widetilde{\mathbf s}_j(f_l;t_j)
+=\widetilde{\mathbf s}_j(f_l)e^{-2\pi i f_l t_j}.
+$$
+
+Let $\widetilde{\boldsymbol\mu}_l$ and $\widetilde D_l$ be the frequency-domain forms of $\boldsymbol\mu$ and $D$. For residual
+
+$$
+\widetilde{\mathbf r}_l
+=\widetilde{\mathbf x}_l-\widetilde{\boldsymbol\mu}_l
+-\widetilde D_l\mathbf z,
+$$
+
+the objective is
+
+$$
+Q=\sum_l w_l\
+\widetilde{\mathbf r}_l^\dagger S_l^{-1}
+\widetilde{\mathbf r}_l+\mathbf z^T\mathbf z,
+$$
+
+where $w_l$ contains the chosen FFT and one-sided-spectrum normalization. Equivalently,
+
+$$
+H=I_{JK}+\sum_l w_l\operatorname{Re}
+\left(\widetilde D_l^\dagger S_l^{-1}\widetilde D_l\right),
+\qquad
+\mathbf g=\sum_l w_l\operatorname{Re}
+\left[\widetilde D_l^\dagger S_l^{-1}
+(\widetilde{\mathbf x}_l-\widetilde{\boldsymbol\mu}_l)\right],
+$$
+
+and $\widehat{\mathbf z}=H^{-1}\mathbf g$. Data, templates, and CSDs must use identical FFT normalization, sampling rate, trace length, and channel ordering. After baseline subtraction, omit the DC bin.
+
+The implementation in `src/nxm.py` uses raw NumPy RFFT covariance,
+$S_l=\mathbb E[\widetilde{\mathbf x}_l\widetilde{\mathbf x}_l^\dagger]$,
+rather than power-density units. It assigns weight 2 to bins with a distinct
+negative-frequency partner, weight 1 to the Nyquist bin, and weight 0 to DC.
+Delays are fractional sample offsets relative to the unshifted templates.
+
+Before inversion, symmetrize each estimated CSD as $(S_l+S_l^\dagger)/2$. If $S_l=U\operatorname{diag}(d_q)U^\dagger$, replace
+
+$$
+d_q\longrightarrow\max(d_q,\epsilon_{\mathrm{CSD}}d_{\max})
+$$
+
+with a configured floor $\epsilon_{\mathrm{CSD}}>0$. This prevents poorly estimated noise modes from dominating the fit.
+
+## 3. Processing procedure
 
 ### 3.1 Template generation
 
+1. Select clean, high-signal-to-noise pulses spanning the reconstruction range. Sampling approximately uniformly in amplitude prevents dense energy regions from dominating the PCA.
+2. Subtract each channel baseline, estimate its arrival time, and align the training pulses.
+3. Build a mean template and estimate each pulse amplitude with a single-template optimal filter. Alternate these two steps until the mean normalized residual is negligible.
+4. Form residuals $\mathbf r=\mathbf x/A-\mathbf s_0$. Apply the configured low-pass filter and a smooth pulse-region window so baseline noise does not define the PCA modes.
+5. Fit PCA separately for each channel. Retain a fixed, configurable number $K$ of modes; the current default is $K=3$. Save $\mathbf s_0$, $\mathbf s_k$, $\lambda_k$, timing, sampling, filtering, and channel-order metadata.
+
 ### 3.2 Noise CSD generation
 
-### 3.3 Finding initial value of time offset and amplitudes for each channel
+Use synchronized noise-only traces with the same sampling rate and length as the signal traces. Apply the same baseline or detrending convention, compute each auto- and cross-spectrum, and average over many traces. Check that every $S_l$ is Hermitian and positive definite after eigenvalue flooring.
 
-### 3.4 Joint fit 
+### 3.3 Initial amplitudes and delays
+
+Run a linear mean-template optimal filter to obtain initial $A_j$ and $t_j$ for every channel. Clip the starting amplitudes to the nonnegative domain. Restrict each $t_j$ to a configured window around its initial estimate; this prevents low-signal-to-noise channels from moving to unrelated noise fluctuations. The linear multi-template fit may also be used as an initializer, but not as the final estimator because it lacks the PCA prior and scale-invariant parameterization.
+
+### 3.4 Joint profiled fit
+
+For each trial $(\mathbf A,\mathbf t)$, construct $\widetilde{\boldsymbol\mu}_l$ and $\widetilde D_l$, solve $H\widehat{\mathbf z}=\mathbf g$, and evaluate $Q_{\mathrm{prof}}=Q(\mathbf A,\mathbf t,\widehat{\mathbf z})$. Minimize this objective with bounds $A_j\geq0$ and the configured timing intervals.
+
+Store $\widehat{\mathbf A}$, $\widehat{\mathbf t}$, $\widehat{\mathbf z}$, the noise-residual term, the PCA-prior term, the total objective, optimizer status, and any active bounds. Large $|z_k|$, structured whitened residuals, or repeated boundary hits indicate template mismatch or a failed fit. Validate the workflow with held-out pulses, noise-only traces, and simulated pulse injections before applying it to physics data.
 
 
