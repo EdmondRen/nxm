@@ -325,8 +325,8 @@ class NxMReconstructor:
             np.isfinite(delay_values)
         ):
             raise ValueError("amplitudes and delays must be finite")
-        if np.any(amplitude_values < 0.0):
-            raise ValueError("amplitudes must be nonnegative")
+        # if np.any(amplitude_values < 0.0):
+        #     raise ValueError("amplitudes must be nonnegative")
         return amplitude_values, delay_values
 
     def _normalize_delay_bounds(
@@ -353,8 +353,7 @@ class NxMReconstructor:
 
         if full:
             angular = (
-                2.0
-                * np.pi
+                2.0 * np.pi
                 * np.arange(self._full_frequency_count, dtype=float)
                 / self.n_samples
             )
@@ -367,12 +366,26 @@ class NxMReconstructor:
         trace_fft: ComplexArray,
         amplitudes: FloatArray,
         delays: FloatArray,
+        debug = False
     ) -> tuple[NxMProfileResult, ComplexArray]:
-        """Profile shape coefficients for precomputed trace spectra."""
+        """
+        Profile shape coefficients for precomputed trace spectra.
+        
+        trace_fft: shape (n_frequencies, n_channels)
+        amplitudes: shape (n_channels,)
+        delays: shape (n_channels,)
+        
+        """
 
         phase = self._phase(delays)
         shifted_mean = self._mean_fft * phase
         residual_without_shape = trace_fft - amplitudes[None, :] * shifted_mean
+        if debug:
+            import matplotlib.pyplot as plt
+            plt.plot(np.fft.irfft(residual_without_shape.T[0]))
+            plt.plot(np.fft.irfft(trace_fft.T[0]))
+            plt.plot(np.fft.irfft((amplitudes[None, :] * shifted_mean).T[0]))
+            plt.show()
 
         if self.n_modes:
             shifted_basis = self._basis_fft * phase[:, :, None]
@@ -570,6 +583,7 @@ class NxMReconstructor:
         trace_values = self._validate_traces(traces)
         trace_fft = np.fft.rfft(trace_values, axis=-1).T[: self.frequency_limit]
 
+        ## Get initial amplitudes and delays, either from user input or by estimating them.
         if initial_amplitudes is None or initial_delays is None:
             estimated_amplitudes, estimated_delays = self.initialize(
                 trace_values, delay_bounds=initialization_bounds
@@ -590,6 +604,7 @@ class NxMReconstructor:
         )
         amplitudes, delays = self._validate_parameters(amplitudes, delays)
 
+        ## Get delay bounds for the final fit, either from user input or by constructing them from the initial delays and half-width.
         if delay_bounds is None:
             half_width = np.asarray(delay_half_width, dtype=float)
             if half_width.ndim == 0:
@@ -606,6 +621,7 @@ class NxMReconstructor:
         else:
             final_delay_bounds = self._normalize_delay_bounds(delay_bounds)
 
+        ## Clip the delays to the final bounds.
         delays = np.clip(
             delays, final_delay_bounds[:, 0], final_delay_bounds[:, 1]
         )
