@@ -549,15 +549,18 @@ class NxMReconstructor:
         self,
         traces: ArrayLike,
         *,
+        fix_delay: bool = False,
         initial_amplitudes: ArrayLike | None = None,
         initial_delays: ArrayLike | None = None,
         initialization_bounds: ArrayLike = (-150.0, 150.0),
         delay_bounds: ArrayLike | None = None,
         delay_half_width: float | ArrayLike = 10.0,
         optimizer_options: dict[str, float | int | bool] | None = None,
+        method = "Powell"
     ) -> NxMFitResult:
         """Fit amplitudes and delays while profiling PCA coefficients.
 
+        
         Missing initial values are filled by :meth:`initialize`. When explicit
         final delay bounds are absent, each delay is restricted to
         ``initial_delay +/- delay_half_width``.
@@ -565,6 +568,7 @@ class NxMReconstructor:
         Args:
             traces: Baseline-subtracted traces with shape
                 ``(n_channels, n_samples)``.
+            fix_delay: If ``fix_delay`` is True, the delays are fixed at their initial values. Default is ``False``.
             initial_amplitudes: Optional nonnegative starting amplitudes.
             initial_delays: Optional starting delays in samples.
             initialization_bounds: Search bounds used by :meth:`initialize`.
@@ -625,17 +629,28 @@ class NxMReconstructor:
         delays = np.clip(
             delays, final_delay_bounds[:, 0], final_delay_bounds[:, 1]
         )
-        start = np.concatenate((amplitudes, delays))
-        bounds = [(0.0, None)] * self.n_channels + [
-            tuple(pair) for pair in final_delay_bounds
-        ]
+        if not fix_delay:
+            start = np.concatenate((amplitudes, delays))
+            bounds = [(0.0, None)] * self.n_channels + [
+                tuple(pair) for pair in final_delay_bounds
+            ]
+        else:
+            start = amplitudes
+            bounds = [(0.0, None)] * self.n_channels
 
         def objective(parameters: FloatArray) -> float:
-            profile, _ = self._profile_fft(
-                trace_fft,
-                parameters[: self.n_channels],
-                parameters[self.n_channels :],
-            )
+            if not fix_delay:
+                profile, _ = self._profile_fft(
+                    trace_fft,
+                    parameters[: self.n_channels],
+                    parameters[self.n_channels :],
+                )
+            else:
+                profile, _ = self._profile_fft(
+                    trace_fft,
+                    parameters[: self.n_channels],
+                    delays,
+                )
             return profile.objective
 
         options: dict[str, float | int | bool] = {
@@ -648,7 +663,7 @@ class NxMReconstructor:
         optimized = optimize.minimize(
             objective,
             start,
-            method="Powell",
+            method=method,
             bounds=bounds,
             options=options,
         )
@@ -656,7 +671,7 @@ class NxMReconstructor:
         fitted_amplitudes = np.asarray(
             optimized.x[: self.n_channels], dtype=float
         )
-        fitted_delays = np.asarray(optimized.x[self.n_channels :], dtype=float)
+        fitted_delays = np.asarray(optimized.x[self.n_channels :], dtype=float) if not fix_delay else delays
         fitted_profile, _ = self._profile_fft(
             trace_fft, fitted_amplitudes, fitted_delays
         )
