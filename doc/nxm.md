@@ -182,6 +182,33 @@ rather than power-density units. It assigns weight 2 to bins with a distinct
 negative-frequency partner, weight 1 to the Nyquist bin, and weight 0 to DC.
 Delays are fractional sample offsets relative to the unshifted templates.
 
+For a result returned by `fit`, call
+`reconstructor.reduced_chi_square(result)`. The implementation derives the
+number of real constraints from the frequency bins actually selected: an
+interior RFFT bin counts twice, DC and Nyquist count once, and the count is
+multiplied by the number of channels. It excludes fixed delays and outer
+parameters at active bounds from the local model Jacobian.
+
+The default effective degrees of freedom account for the Gaussian PCA prior.
+If $G=J_\theta^T WJ_\theta$ is the local parameter Gram matrix and $P$ has unit
+entries for standardized PCA coefficients and zero entries for unregularized
+outer parameters, define
+
+$$
+T=(G+P)^+G,
+\qquad
+\nu_{\mathrm{eff}}
+=N_{\mathrm{data}}-2\operatorname{tr}(T)+\operatorname{tr}(T^2).
+$$
+
+Then `reduced_chi_square(result)` returns
+$Q_{\mathrm{residual}}/\nu_{\mathrm{eff}}`. This is a local-linear effective
+DOF calculation for the nonlinear fit. For comparison,
+`reduced_chi_square(result, dof_method="nominal")` subtracts the numerical rank
+of the active Jacobian instead. Neither convention can compensate for an
+incorrectly normalized CSD: values near one require the raw NumPy RFFT
+covariance convention used by `estimate_csd`.
+
 Before inversion, symmetrize each estimated CSD as $(S_l+S_l^\dagger)/2$. If $S_l=U\operatorname{diag}(d_q)U^\dagger$, replace
 
 $$
@@ -211,6 +238,13 @@ Run a linear mean-template optimal filter to obtain initial $A_j$ and $t_j$ for 
 ### 3.4 Joint profiled fit
 
 For each trial $(\mathbf A,\mathbf t)$, construct $\widetilde{\boldsymbol\mu}_l$ and $\widetilde D_l$, solve $H\widehat{\mathbf z}=\mathbf g$, and evaluate $Q_{\mathrm{prof}}=Q(\mathbf A,\mathbf t,\widehat{\mathbf z})$. Minimize this objective with bounds $A_j\geq0$ and the configured timing intervals.
+
+When delays are fixed, their phases and all frequency-summed template, data,
+and CSD contractions are constant during the outer fit. The implementation
+precomputes these sufficient statistics once and evaluates subsequent trial
+amplitudes using only small channel/mode matrices. This is algebraically
+equivalent to the frequency-bin calculation; caching shifted templates alone
+would leave the dominant frequency contractions inside every objective call.
 
 Store $\widehat{\mathbf A}$, $\widehat{\mathbf t}$, $\widehat{\mathbf z}$, the noise-residual term, the PCA-prior term, the total objective, optimizer status, and any active bounds. Large $|z_k|$, structured whitened residuals, or repeated boundary hits indicate template mismatch or a failed fit. Validate the workflow with held-out pulses, noise-only traces, and simulated pulse injections before applying it to physics data.
 

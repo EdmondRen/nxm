@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Sequence
+from dataclasses import dataclass, replace
+from typing import Literal, Sequence
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -51,6 +51,9 @@ class NxMFitResult:
         nit: Number of outer optimizer iterations, when reported.
         amplitude_at_bound: Flags for amplitudes at their zero lower bound.
         delay_at_bound: Flags for delays at either configured bound.
+        n_fitted_parameters: Nominal number of fitted amplitudes, delays, and
+            identifiable PCA coefficients in the local model Jacobian.
+        delays_fitted: Whether delays were free parameters in the outer fit.
     """
 
     amplitudes: FloatArray
@@ -65,6 +68,85 @@ class NxMFitResult:
     nit: int
     amplitude_at_bound: NDArray[np.bool_]
     delay_at_bound: NDArray[np.bool_]
+    n_fitted_parameters: int | None = None
+    delays_fitted: bool | None = None
+
+
+@dataclass(frozen=True)
+class _FixedDelayWorkspace:
+    """Frequency-summed terms for amplitude-only profile evaluations."""
+
+    basis_gram: FloatArray
+    basis_data: FloatArray
+    basis_mean: FloatArray
+    mean_gram: FloatArray
+    mean_data: FloatArray
+    data_objective: float
+    n_channels: int
+    n_modes: int
+
+    def evaluate(self, amplitudes: FloatArray) -> NxMProfileResult:
+        """Profile PCA coefficients without revisiting frequency bins.
+
+        Args:
+            amplitudes: Trial channel amplitudes.
+
+        Returns:
+            Profiled coefficients and objective components.
+        """
+
+        residual_without_shape = float(
+            self.data_objective
+            - 2.0 * np.dot(self.mean_data, amplitudes)
+            + np.einsum(
+                "j,jm,m->",
+                amplitudes,
+                self.mean_gram,
+                amplitudes,
+                optimize=True,
+            )
+        )
+        if self.n_modes:
+            repeated_amplitudes = np.repeat(amplitudes, self.n_modes)
+            hessian = (
+                np.eye(self.n_channels * self.n_modes)
+                + repeated_amplitudes[:, None]
+                * self.basis_gram
+                * repeated_amplitudes[None, :]
+            )
+            projected_residual = self.basis_data - np.einsum(
+                "jkm,m->jk",
+                self.basis_mean,
+                amplitudes,
+                optimize=True,
+            )
+            gradient = repeated_amplitudes * projected_residual.ravel()
+            flat_coefficients = np.linalg.solve(hessian, gradient)
+            coefficients = flat_coefficients.reshape(
+                self.n_channels, self.n_modes
+            )
+            prior_objective = float(np.dot(flat_coefficients, flat_coefficients))
+            objective = float(
+                residual_without_shape - np.dot(gradient, flat_coefficients)
+            )
+            residual_objective = objective - prior_objective
+        else:
+            coefficients = np.empty((self.n_channels, 0), dtype=float)
+            prior_objective = 0.0
+            residual_objective = residual_without_shape
+            objective = residual_objective
+
+        # Only suppress floating-point cancellation at an exact fit.
+        tolerance = 1e-9 * max(1.0, abs(objective), abs(prior_objective))
+        if residual_objective < 0.0 and residual_objective > -tolerance:
+            residual_objective = 0.0
+            objective = prior_objective
+        return NxMProfileResult(
+            shape_coefficients=coefficients,
+            residual_objective=float(residual_objective),
+            prior_objective=float(prior_objective),
+            objective=float(objective),
+        )
 
 
 def estimate_csd(
@@ -448,6 +530,181 @@ class NxMReconstructor:
         )
         return profile, model_fft
 
+    def _prepare_fixed_delay_workspace(
+        self,
+        trace_fft: ComplexArray,
+        delays: FloatArray,
+    ) -> _FixedDelayWorkspace:
+        """Precompute sufficient statistics for an amplitude-only fit.
+
+        Args:
+            trace_fft: Selected trace spectrum with shape
+                ``(n_frequencies, n_channels)``.
+            delays: Fixed per-channel delays in samples.
+
+        Returns:
+            Workspace whose evaluations no longer scale with frequency count.
+        """
+
+        phase = self._phase(delays)
+        shifted_mean = self._mean_fft * phase
+        weighted_precision = self._weights[:, None, None] * self.inverse_noise_csd
+        weighted_trace = np.einsum(
+            "fjm,fm->fj",
+            weighted_precision,
+            trace_fft,
+            optimize=True,
+        )
+        data_objective = float(
+            np.sum(np.real(trace_fft.conj() * weighted_trace))
+        )
+        mean_data = np.einsum(
+            "fj,fj->j",
+            shifted_mean.conj(),
+            weighted_trace,
+            optimize=True,
+        ).real
+        mean_gram = np.einsum(
+            "fj,fjm,fm->jm",
+            shifted_mean.conj(),
+            weighted_precision,
+            shifted_mean,
+            optimize=True,
+        ).real
+        mean_gram = 0.5 * (mean_gram + mean_gram.T)
+
+        if self.n_modes:
+            shifted_basis = self._basis_fft * phase[:, :, None]
+            basis_gram_blocks = np.einsum(
+                "fjk,fjm,fml->jkml",
+                shifted_basis.conj(),
+                weighted_precision,
+                shifted_basis,
+                optimize=True,
+            ).real
+            basis_gram = basis_gram_blocks.reshape(
+                self.n_channels * self.n_modes,
+                self.n_channels * self.n_modes,
+            )
+            basis_gram = 0.5 * (basis_gram + basis_gram.T)
+            basis_data = np.einsum(
+                "fjk,fj->jk",
+                shifted_basis.conj(),
+                weighted_trace,
+                optimize=True,
+            ).real
+            basis_mean = np.einsum(
+                "fjk,fjm,fm->jkm",
+                shifted_basis.conj(),
+                weighted_precision,
+                shifted_mean,
+                optimize=True,
+            ).real
+        else:
+            basis_gram = np.empty((0, 0), dtype=float)
+            basis_data = np.empty((self.n_channels, 0), dtype=float)
+            basis_mean = np.empty(
+                (self.n_channels, 0, self.n_channels), dtype=float
+            )
+
+        return _FixedDelayWorkspace(
+            basis_gram=basis_gram,
+            basis_data=basis_data,
+            basis_mean=basis_mean,
+            mean_gram=mean_gram,
+            mean_data=mean_data,
+            data_objective=data_objective,
+            n_channels=self.n_channels,
+            n_modes=self.n_modes,
+        )
+
+    def _local_parameter_gram(
+        self,
+        result: NxMFitResult,
+    ) -> tuple[FloatArray, FloatArray]:
+        """Return the active local model Gram matrix and prior precision.
+
+        Args:
+            result: Fit result at which to linearize the pulse model.
+
+        Returns:
+            The CSD-weighted parameter Gram matrix and diagonal prior
+            precision for its columns.
+
+        Raises:
+            ValueError: If the fit result is incompatible or does not record
+                whether delays were fitted.
+        """
+
+        amplitudes, delays = self._validate_parameters(
+            result.amplitudes, result.delays
+        )
+        coefficients = np.asarray(result.shape_coefficients, dtype=float)
+        if coefficients.shape != (self.n_channels, self.n_modes):
+            raise ValueError("result shape coefficients do not match reconstructor")
+        if not np.all(np.isfinite(coefficients)):
+            raise ValueError("result shape coefficients must be finite")
+        if result.delays_fitted is None:
+            raise ValueError(
+                "result must record whether delay parameters were fitted"
+            )
+
+        amplitude_at_bound = np.asarray(result.amplitude_at_bound, dtype=bool)
+        delay_at_bound = np.asarray(result.delay_at_bound, dtype=bool)
+        expected_shape = (self.n_channels,)
+        if amplitude_at_bound.shape != expected_shape:
+            raise ValueError("result amplitude bound flags do not match reconstructor")
+        if delay_at_bound.shape != expected_shape:
+            raise ValueError("result delay bound flags do not match reconstructor")
+
+        phase = self._phase(delays)
+        shifted_mean = self._mean_fft * phase
+        shifted_basis = self._basis_fft * phase[:, :, None]
+        fitted_shape = np.einsum(
+            "fjk,jk->fj", shifted_basis, coefficients, optimize=True
+        )
+        amplitude_derivative = shifted_mean + fitted_shape
+        delay_derivative = (
+            -1j
+            * self._angular_frequencies[:, None]
+            * amplitudes[None, :]
+            * amplitude_derivative
+        )
+
+        derivatives = np.empty(
+            (self.frequency_limit, self.n_channels, self.n_modes + 2),
+            dtype=np.complex128,
+        )
+        derivatives[:, :, 0] = amplitude_derivative
+        derivatives[:, :, 1] = delay_derivative
+        derivatives[:, :, 2:] = shifted_basis * amplitudes[None, :, None]
+
+        active = np.ones((self.n_channels, self.n_modes + 2), dtype=bool)
+        active[:, 0] = ~amplitude_at_bound
+        active[:, 1] = bool(result.delays_fitted) & ~delay_at_bound
+        prior_precision = np.zeros_like(active, dtype=float)
+        prior_precision[:, 2:] = 1.0
+        active_flat = active.ravel()
+        active_prior = prior_precision.ravel()[active_flat]
+        if not np.any(active_flat):
+            return np.empty((0, 0), dtype=float), active_prior
+
+        weighted_precision = self._weights[:, None, None] * self.inverse_noise_csd
+        gram_blocks = np.einsum(
+            "fja,fjm,fmb->jamb",
+            derivatives.conj(),
+            weighted_precision,
+            derivatives,
+            optimize=True,
+        ).real
+        full_parameter_count = self.n_channels * (self.n_modes + 2)
+        full_gram = gram_blocks.reshape(
+            full_parameter_count, full_parameter_count
+        )
+        gram = full_gram[np.ix_(active_flat, active_flat)]
+        gram = 0.5 * (gram + gram.T)
+        return gram, active_prior
+
     def profile(
         self,
         traces: ArrayLike,
@@ -476,6 +733,110 @@ class NxMReconstructor:
         trace_fft = np.fft.rfft(trace_values, axis=-1).T[: self.frequency_limit]
         profile, _ = self._profile_fft(trace_fft, amplitude_values, delay_values)
         return profile
+
+    def degrees_of_freedom(
+        self,
+        result: NxMFitResult,
+        *,
+        method: Literal["effective", "nominal"] = "effective",
+    ) -> float:
+        """Return residual degrees of freedom for a fit result.
+
+        The number of real data constraints is computed from the RFFT bins
+        actually used by this reconstructor. An interior RFFT bin counts twice
+        because it represents both positive and negative frequencies; DC and
+        Nyquist, when included, count once. The result is then multiplied by
+        the number of channels.
+
+        The effective method uses the local penalized-model smoother and lets
+        each regularized PCA direction consume a fractional degree of freedom.
+        The nominal method subtracts the numerical rank of the active local
+        model Jacobian. Fixed delays and outer parameters at bounds are not
+        active in either calculation.
+
+        Args:
+            result: Result returned by :meth:`fit`.
+            method: ``"effective"`` or ``"nominal"``.
+
+        Returns:
+            Positive residual degrees of freedom.
+
+        Raises:
+            TypeError: If ``result`` is not an :class:`NxMFitResult`.
+            ValueError: If the method is invalid, the result is incompatible,
+                or the resulting degrees of freedom are not positive.
+        """
+
+        if not isinstance(result, NxMFitResult):
+            raise TypeError("result must be an NxMFitResult")
+        if method not in {"effective", "nominal"}:
+            raise ValueError("method must be 'effective' or 'nominal'")
+
+        data_degrees_of_freedom = float(
+            self.n_channels * np.sum(self._weights) / 2
+        )
+        gram, prior_precision = self._local_parameter_gram(result)
+        if gram.size == 0:
+            model_degrees_of_freedom = 0.0
+        else:
+            nominal_rank = float(np.linalg.matrix_rank(gram))
+            if method == "nominal":
+                model_degrees_of_freedom = nominal_rank
+            else:
+                penalized_gram = gram + np.diag(prior_precision)
+                parameter_smoother = np.linalg.pinv(
+                    penalized_gram, hermitian=True
+                ) @ gram
+                smoother_trace = float(np.trace(parameter_smoother).real)
+                smoother_square_trace = float(
+                    np.trace(parameter_smoother @ parameter_smoother).real
+                )
+                # This is the residual-variance DOF correction for a linear
+                # smoother, applied to the local pulse-model linearization.
+                effective_model_dof = (
+                    2.0 * smoother_trace - smoother_square_trace
+                )
+                # Roundoff in a poorly conditioned Gram matrix must not make
+                # regularization add parameters or consume negative DOF.
+                model_degrees_of_freedom = float(
+                    np.clip(effective_model_dof, 0.0, nominal_rank)
+                )
+        residual_degrees_of_freedom = (
+            data_degrees_of_freedom - model_degrees_of_freedom
+        )
+        if residual_degrees_of_freedom <= 0:
+            raise ValueError(
+                "model degrees of freedom must be smaller than the number "
+                "of real data constraints"
+            )
+        return float(residual_degrees_of_freedom)
+
+    def reduced_chi_square(
+        self,
+        result: NxMFitResult,
+        *,
+        dof_method: Literal["effective", "nominal"] = "effective",
+    ) -> float:
+        """Return residual chi-square per effective or nominal DOF.
+
+        Args:
+            result: Result returned by :meth:`fit`.
+            dof_method: Degrees-of-freedom convention passed to
+                :meth:`degrees_of_freedom`.
+
+        Returns:
+            Residual objective divided by the selected residual degrees of
+            freedom.
+
+        Raises:
+            TypeError: If ``result`` is not an :class:`NxMFitResult`.
+            ValueError: If the method or result is invalid.
+        """
+
+        degrees_of_freedom = self.degrees_of_freedom(
+            result, method=dof_method
+        )
+        return float(result.residual_objective / degrees_of_freedom)
 
     def initialize(
         self,
@@ -556,7 +917,7 @@ class NxMReconstructor:
         delay_bounds: ArrayLike | None = None,
         delay_half_width: float | ArrayLike = 10.0,
         optimizer_options: dict[str, float | int | bool] | None = None,
-        method = "Powell"
+        method: str = "Powell",
     ) -> NxMFitResult:
         """Fit amplitudes and delays while profiling PCA coefficients.
 
@@ -568,14 +929,15 @@ class NxMReconstructor:
         Args:
             traces: Baseline-subtracted traces with shape
                 ``(n_channels, n_samples)``.
-            fix_delay: If ``fix_delay`` is True, the delays are fixed at their initial values. Default is ``False``.
+            fix_delay: Whether to hold delays at their initial values.
             initial_amplitudes: Optional nonnegative starting amplitudes.
             initial_delays: Optional starting delays in samples.
             initialization_bounds: Search bounds used by :meth:`initialize`.
             delay_bounds: Optional final shared or per-channel bounds.
             delay_half_width: Final half-width around each initial delay when
                 ``delay_bounds`` is not supplied.
-            optimizer_options: Options passed to SciPy's Powell optimizer.
+            optimizer_options: Options passed to SciPy's optimizer.
+            method: Optimization method passed to :func:`scipy.optimize.minimize`.
 
         Returns:
             Fitted parameters and diagnostics.
@@ -587,7 +949,7 @@ class NxMReconstructor:
         trace_values = self._validate_traces(traces)
         trace_fft = np.fft.rfft(trace_values, axis=-1).T[: self.frequency_limit]
 
-        ## Get initial amplitudes and delays, either from user input or by estimating them.
+        # Fill missing initial amplitudes or delays with matched-filter estimates.
         if initial_amplitudes is None or initial_delays is None:
             estimated_amplitudes, estimated_delays = self.initialize(
                 trace_values, delay_bounds=initialization_bounds
@@ -608,7 +970,7 @@ class NxMReconstructor:
         )
         amplitudes, delays = self._validate_parameters(amplitudes, delays)
 
-        ## Get delay bounds for the final fit, either from user input or by constructing them from the initial delays and half-width.
+        # Use explicit delay bounds or construct them around the initial values.
         if delay_bounds is None:
             half_width = np.asarray(delay_half_width, dtype=float)
             if half_width.ndim == 0:
@@ -625,7 +987,7 @@ class NxMReconstructor:
         else:
             final_delay_bounds = self._normalize_delay_bounds(delay_bounds)
 
-        ## Clip the delays to the final bounds.
+        # Ensure the optimizer starts within its final delay bounds.
         delays = np.clip(
             delays, final_delay_bounds[:, 0], final_delay_bounds[:, 1]
         )
@@ -638,6 +1000,12 @@ class NxMReconstructor:
             start = amplitudes
             bounds = [(0.0, None)] * self.n_channels
 
+        fixed_delay_workspace = (
+            self._prepare_fixed_delay_workspace(trace_fft, delays)
+            if fix_delay
+            else None
+        )
+
         def objective(parameters: FloatArray) -> float:
             if not fix_delay:
                 profile, _ = self._profile_fft(
@@ -646,10 +1014,10 @@ class NxMReconstructor:
                     parameters[self.n_channels :],
                 )
             else:
-                profile, _ = self._profile_fft(
-                    trace_fft,
-                    parameters[: self.n_channels],
-                    delays,
+                if fixed_delay_workspace is None:
+                    raise RuntimeError("fixed-delay workspace was not initialized")
+                profile = fixed_delay_workspace.evaluate(
+                    parameters[: self.n_channels]
                 )
             return profile.objective
 
@@ -671,10 +1039,17 @@ class NxMReconstructor:
         fitted_amplitudes = np.asarray(
             optimized.x[: self.n_channels], dtype=float
         )
-        fitted_delays = np.asarray(optimized.x[self.n_channels :], dtype=float) if not fix_delay else delays
-        fitted_profile, _ = self._profile_fft(
-            trace_fft, fitted_amplitudes, fitted_delays
+        fitted_delays = (
+            np.asarray(optimized.x[self.n_channels :], dtype=float)
+            if not fix_delay
+            else delays
         )
+        if fixed_delay_workspace is None:
+            fitted_profile, _ = self._profile_fft(
+                trace_fft, fitted_amplitudes, fitted_delays
+            )
+        else:
+            fitted_profile = fixed_delay_workspace.evaluate(fitted_amplitudes)
         amplitude_tolerance = max(
             1e-8 * max(1.0, float(np.max(fitted_amplitudes, initial=0.0))),
             float(options.get("xtol", 1e-3)),
@@ -686,7 +1061,7 @@ class NxMReconstructor:
             np.abs(fitted_delays - final_delay_bounds[:, 1]) <= delay_tolerance,
         )
 
-        return NxMFitResult(
+        result = NxMFitResult(
             amplitudes=fitted_amplitudes,
             delays=fitted_delays,
             shape_coefficients=fitted_profile.shape_coefficients,
@@ -699,6 +1074,13 @@ class NxMReconstructor:
             nit=int(getattr(optimized, "nit", -1)),
             amplitude_at_bound=amplitude_at_bound,
             delay_at_bound=delay_at_bound,
+            delays_fitted=not fix_delay,
+        )
+        nominal_dof = self.degrees_of_freedom(result, method="nominal")
+        data_dof = int(self.n_channels * np.sum(self._weights))
+        return replace(
+            result,
+            n_fitted_parameters=int(round(data_dof - nominal_dof)),
         )
 
     def reconstruct(self, result: NxMFitResult) -> FloatArray:

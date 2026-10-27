@@ -113,22 +113,37 @@ def make_result(
     amplitudes: np.ndarray,
     delays: np.ndarray,
     coefficients: np.ndarray,
+    *,
+    residual_objective: float = 0.0,
+    delays_fitted: bool | None = None,
 ) -> NxMFitResult:
-    """Build a fit result for reconstruction-only tests."""
+    """Build a fit result for reconstruction and diagnostic tests.
+
+    Args:
+        amplitudes: Per-channel amplitudes.
+        delays: Per-channel delays.
+        coefficients: Standardized PCA coefficients.
+        residual_objective: CSD-weighted residual objective.
+        delays_fitted: Whether delays should count as fitted parameters.
+
+    Returns:
+        Synthetic fit result with compatible diagnostic arrays.
+    """
 
     return NxMFitResult(
         amplitudes=amplitudes,
         delays=delays,
         shape_coefficients=coefficients,
-        residual_objective=0.0,
+        residual_objective=residual_objective,
         prior_objective=float(np.sum(coefficients**2)),
-        objective=float(np.sum(coefficients**2)),
+        objective=float(residual_objective + np.sum(coefficients**2)),
         success=True,
         message="synthetic",
         nfev=0,
         nit=0,
         amplitude_at_bound=np.zeros_like(amplitudes, dtype=bool),
         delay_at_bound=np.zeros_like(delays, dtype=bool),
+        delays_fitted=delays_fitted,
     )
 
 
@@ -283,6 +298,226 @@ def test_profile_uses_off_diagonal_csd_terms() -> None:
     )
 
     assert profile.residual_objective == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("n_modes", [0, 2])
+def test_fixed_delay_workspace_matches_frequency_profile(n_modes: int) -> None:
+    """Cached amplitude evaluations should equal the frequency-domain path."""
+
+    reconstructor, _, _, _ = make_problem(
+        n_channels=3, n_modes=n_modes, n_samples=128
+    )
+    rng = np.random.default_rng(19 + n_modes)
+    traces = rng.normal(scale=0.01, size=(3, 128))
+    trace_fft = np.fft.rfft(traces, axis=-1).T[: reconstructor.frequency_limit]
+    amplitudes = np.array([0.2, 1.3, 2.0])
+    delays = np.array([1.2, -0.7, 2.1])
+
+    expected, _ = reconstructor._profile_fft(trace_fft, amplitudes, delays)
+    workspace = reconstructor._prepare_fixed_delay_workspace(trace_fft, delays)
+    actual = workspace.evaluate(amplitudes)
+
+    np.testing.assert_allclose(
+        actual.shape_coefficients, expected.shape_coefficients, rtol=1e-11
+    )
+    assert actual.residual_objective == pytest.approx(
+        expected.residual_objective, rel=1e-11, abs=1e-8
+    )
+    assert actual.prior_objective == pytest.approx(
+        expected.prior_objective, rel=1e-11, abs=1e-10
+    )
+    assert actual.objective == pytest.approx(
+        expected.objective, rel=1e-11, abs=1e-8
+    )
+
+
+def test_fixed_delay_fit_automatically_uses_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Amplitude-only fits should not call the repeated-frequency profiler."""
+
+    reconstructor, means, _, _ = make_problem(
+        n_channels=2, n_modes=1, n_samples=64
+    )
+
+    def fail_reference_profile(*args: object, **kwargs: object) -> None:
+        """Fail if the general profiled objective is evaluated."""
+
+        raise AssertionError("fixed-delay fit used the general profile path")
+
+    monkeypatch.setattr(reconstructor, "_profile_fft", fail_reference_profile)
+    result = reconstructor.fit(
+        means,
+        fix_delay=True,
+        initial_amplitudes=np.ones(2),
+        initial_delays=np.zeros(2),
+        optimizer_options={"maxiter": 3},
+    )
+
+    assert result.delays_fitted is False
+    assert np.all(np.isfinite(result.amplitudes))
+    assert np.isfinite(result.objective)
+
+
+def test_reduced_chi_square_uses_selected_real_frequency_constraints() -> None:
+    """Reduced chi-square should count only selected real Fourier constraints."""
+
+    reconstructor, _, _, _ = make_problem(
+        n_channels=2, n_modes=0, n_samples=128
+    )
+    result = make_result(
+        np.zeros(2),
+        np.zeros(2),
+        np.empty((2, 0)),
+        residual_objective=196.0,
+        delays_fitted=False,
+    )
+    result = replace(
+        result,
+        amplitude_at_bound=np.ones(2, dtype=bool),
+    )
+
+    # With 50 selected bins and omitted DC, 49 interior bins provide
+    # 2 * 49 * 2 = 196 real constraints. No local model column is active.
+    assert reconstructor.degrees_of_freedom(result) == pytest.approx(196.0)
+    assert reconstructor.reduced_chi_square(result) == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    ("n_samples", "expected_per_channel"), [(15, 14), (16, 15)]
+)
+def test_data_dof_handles_odd_lengths_and_nyquist(
+    n_samples: int,
+    expected_per_channel: int,
+) -> None:
+    """A full RFFT should count every non-DC real time-domain constraint."""
+
+    reconstructor, _, _, _ = make_problem(
+        n_channels=2, n_modes=0, n_samples=n_samples
+    )
+    result = make_result(
+        np.zeros(2),
+        np.zeros(2),
+        np.empty((2, 0)),
+        delays_fitted=False,
+    )
+    result = replace(result, amplitude_at_bound=np.ones(2, dtype=bool))
+
+    assert reconstructor.degrees_of_freedom(result) == pytest.approx(
+        2 * expected_per_channel
+    )
+
+
+def test_raw_rfft_noise_has_unit_mean_reduced_chi_square() -> None:
+    """Independent raw-RFFT noise objectives should average to reduced chi2 one."""
+
+    reconstructor, _, _, _ = make_problem(
+        n_channels=1,
+        n_modes=0,
+        n_samples=64,
+        noise_scale=0.03,
+    )
+    rng = np.random.default_rng(8675309)
+    event_count = 2000
+    active_bin_count = reconstructor.frequency_limit - 1
+    variance = reconstructor.noise_csd[1:, 0, 0].real
+    spectra = np.empty((event_count, active_bin_count), dtype=complex)
+    spectra[:, :-1] = (
+        rng.normal(size=(event_count, active_bin_count - 1))
+        + 1j * rng.normal(size=(event_count, active_bin_count - 1))
+    ) * np.sqrt(variance[:-1] / 2.0)[None, :]
+    spectra[:, -1] = rng.normal(size=event_count) * np.sqrt(variance[-1])
+    objectives = np.sum(
+        reconstructor._weights[None, 1:]
+        * np.abs(spectra) ** 2
+        / variance[None, :],
+        axis=1,
+    )
+    result = make_result(
+        np.zeros(1),
+        np.zeros(1),
+        np.empty((1, 0)),
+        residual_objective=float(np.mean(objectives)),
+        delays_fitted=False,
+    )
+    result = replace(result, amplitude_at_bound=np.ones(1, dtype=bool))
+
+    assert reconstructor.reduced_chi_square(result) == pytest.approx(
+        1.0, abs=0.02
+    )
+
+
+def test_effective_dof_fractionally_counts_regularized_pca_mode() -> None:
+    """A ridge-regularized PCA direction should consume less than one DOF."""
+
+    reconstructor, _, _, _ = make_problem(
+        n_channels=1, n_modes=1, n_samples=64
+    )
+    result = make_result(
+        np.array([1.5]),
+        np.zeros(1),
+        np.array([[0.2]]),
+        delays_fitted=False,
+    )
+    result = replace(
+        result,
+        amplitude_at_bound=np.ones(1, dtype=bool),
+    )
+    gram, prior = reconstructor._local_parameter_gram(result)
+    assert gram.shape == (1, 1)
+    assert prior[0] == pytest.approx(1.0)
+    shrinkage = gram[0, 0] / (gram[0, 0] + 1.0)
+    data_dof = float(np.sum(reconstructor._weights))
+    expected_effective = data_dof - 2.0 * shrinkage + shrinkage**2
+
+    assert reconstructor.degrees_of_freedom(
+        result, method="effective"
+    ) == pytest.approx(expected_effective)
+    assert reconstructor.degrees_of_freedom(
+        result, method="nominal"
+    ) == pytest.approx(data_dof - 1.0)
+
+
+def test_degrees_of_freedom_excludes_fixed_and_bound_outer_parameters() -> None:
+    """Fixed delays and bound amplitudes should not enter the local Jacobian."""
+
+    reconstructor, _, _, _ = make_problem(
+        n_channels=2, n_modes=0, n_samples=64
+    )
+    fixed = make_result(
+        np.array([1.0, 1.5]),
+        np.array([0.2, -0.3]),
+        np.empty((2, 0)),
+        delays_fitted=False,
+    )
+    variable = replace(fixed, delays_fitted=True)
+    one_bound = replace(
+        fixed,
+        amplitude_at_bound=np.array([True, False]),
+    )
+    data_dof = 2.0 * np.sum(reconstructor._weights)
+
+    assert reconstructor.degrees_of_freedom(
+        fixed, method="nominal"
+    ) == pytest.approx(data_dof - 2.0)
+    assert reconstructor.degrees_of_freedom(
+        variable, method="nominal"
+    ) == pytest.approx(data_dof - 4.0)
+    assert reconstructor.degrees_of_freedom(
+        one_bound, method="nominal"
+    ) == pytest.approx(data_dof - 1.0)
+
+
+def test_degrees_of_freedom_rejects_invalid_method() -> None:
+    """Unknown DOF conventions should fail clearly."""
+
+    reconstructor, _, _, _ = make_problem(n_channels=1, n_modes=0, n_samples=16)
+    result = make_result(
+        np.ones(1), np.zeros(1), np.empty((1, 0)), delays_fitted=False
+    )
+
+    with pytest.raises(ValueError, match="effective"):
+        reconstructor.degrees_of_freedom(result, method="unsupported")
 
 
 def test_end_to_end_fit_recovers_multichannel_injection() -> None:
