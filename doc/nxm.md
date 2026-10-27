@@ -88,6 +88,23 @@ $$
 
 which is minimized numerically over $A\geq0$ and an allowed interval in $t_0$.
 
+### 1.4 Single-channel sufficient statistics
+
+For stationary single-channel noise, shifting the mean and every PCA template
+by the same delay multiplies them by the same unit-magnitude Fourier phase.
+Consequently, the weighted template products
+$\mathbf s_0^T W\mathbf s_0$, $\mathbf B^T W\mathbf B$, and
+$\mathbf B^T W\mathbf s_0$ do not depend on delay. The implementation caches
+these quantities when constructing a one-channel reconstructor. For each trace
+it then caches only the weighted trace-template spectra; one phase vector gives
+the correlations and their exact derivatives at any fractional delay.
+
+This avoids rebuilding frequency-summed matrices during every objective
+evaluation without discretizing the delay. Free-delay one-channel fits select
+L-BFGS-B and the analytic amplitude and delay gradients when `method=None`.
+An explicitly selected optimizer is still honored. Integer-delay matched-filter
+initialization obtains all circular delay responses with one inverse FFT.
+
 ## 2. Multi-channel, multi-template reconstruction
 
 ### 2.1 Joint time-domain model

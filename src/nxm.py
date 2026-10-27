@@ -203,6 +203,195 @@ class _FixedDelayWorkspace:
         return profile, np.asarray(objective_gradient, dtype=float)
 
 
+@dataclass(frozen=True)
+class _SingleChannelWorkspace:
+    """Trace-dependent sufficient statistics for a free-delay 1xM fit."""
+
+    angular_frequencies: FloatArray
+    basis_gram: FloatArray
+    basis_mean: FloatArray
+    identity: FloatArray
+    projection_spectra: ComplexArray
+    rfft_multiplicity: FloatArray
+    mean_gram: float
+    data_objective: float
+    n_samples: int
+
+    @property
+    def n_modes(self) -> int:
+        """Return the number of PCA modes represented by the workspace."""
+
+        return self.basis_mean.size
+
+    def correlations(self, delay: float) -> tuple[FloatArray, FloatArray]:
+        """Return trace correlations and their exact delay derivatives.
+
+        Args:
+            delay: Fractional template shift in samples.
+
+        Returns:
+            Correlations with the mean followed by the PCA templates, and
+            derivatives of those correlations with respect to delay.
+        """
+
+        phase = np.exp(1j * self.angular_frequencies * delay)
+        correlations = np.real(phase @ self.projection_spectra)
+        derivatives = np.real(
+            (1j * self.angular_frequencies * phase) @ self.projection_spectra
+        )
+        return np.asarray(correlations), np.asarray(derivatives)
+
+    def integer_delay_correlations(self) -> FloatArray:
+        """Return exact mean-template correlations at every integer delay."""
+
+        full_frequency_count = self.n_samples // 2 + 1
+        correlation_spectrum = np.zeros(
+            full_frequency_count, dtype=np.complex128
+        )
+        selected_count = len(self.rfft_multiplicity)
+        correlation_spectrum[:selected_count] = (
+            self.projection_spectra[:, 0] / self.rfft_multiplicity
+        )
+        # NumPy's real inverse FFT requires real-valued self-conjugate bins.
+        correlation_spectrum[0] = correlation_spectrum[0].real
+        if self.n_samples % 2 == 0 and selected_count == full_frequency_count:
+            correlation_spectrum[-1] = correlation_spectrum[-1].real
+        return np.asarray(
+            self.n_samples
+            * np.fft.irfft(correlation_spectrum, n=self.n_samples),
+            dtype=float,
+        )
+
+    def evaluate(self, parameters: FloatArray) -> NxMProfileResult:
+        """Profile PCA coefficients at a trial amplitude and delay.
+
+        Args:
+            parameters: Amplitude and delay in that order.
+
+        Returns:
+            Profiled coefficients and objective components.
+        """
+
+        profile, _ = self.evaluate_with_gradient(parameters)
+        return profile
+
+    def evaluate_with_gradient(
+        self,
+        parameters: FloatArray,
+    ) -> tuple[NxMProfileResult, FloatArray]:
+        """Return the profiled objective and its exact outer gradient.
+
+        Args:
+            parameters: Amplitude and delay in that order.
+
+        Returns:
+            Profile result and derivatives with respect to amplitude and
+            delay.
+        """
+
+        amplitude, delay = np.asarray(parameters, dtype=float)
+        correlations, delay_derivatives = self.correlations(float(delay))
+        mean_data = float(correlations[0])
+        mean_data_derivative = float(delay_derivatives[0])
+        residual_without_shape = float(
+            self.data_objective
+            - 2.0 * amplitude * mean_data
+            + amplitude**2 * self.mean_gram
+        )
+        amplitude_gradient = -2.0 * mean_data + 2.0 * amplitude * self.mean_gram
+        delay_gradient = -2.0 * amplitude * mean_data_derivative
+
+        if self.n_modes:
+            basis_data = correlations[1:]
+            basis_data_derivative = delay_derivatives[1:]
+            hessian = self.identity + amplitude**2 * self.basis_gram
+            projected_residual = basis_data - amplitude * self.basis_mean
+            coefficient_gradient = amplitude * projected_residual
+            coefficients = np.linalg.solve(hessian, coefficient_gradient)
+            prior_objective = float(np.dot(coefficients, coefficients))
+            objective = float(
+                residual_without_shape
+                - np.dot(coefficient_gradient, coefficients)
+            )
+            residual_objective = objective - prior_objective
+            amplitude_gradient += float(
+                -2.0
+                * np.dot(basis_data - 2.0 * amplitude * self.basis_mean, coefficients)
+                + 2.0
+                * amplitude
+                * coefficients
+                @ self.basis_gram
+                @ coefficients
+            )
+            delay_gradient += float(
+                -2.0
+                * amplitude
+                * np.dot(basis_data_derivative, coefficients)
+            )
+        else:
+            coefficients = np.empty(0, dtype=float)
+            prior_objective = 0.0
+            residual_objective = residual_without_shape
+            objective = residual_objective
+
+        # Only suppress floating-point cancellation at an exact fit.
+        tolerance = 1e-9 * max(1.0, abs(objective), abs(prior_objective))
+        if residual_objective < 0.0 and residual_objective > -tolerance:
+            residual_objective = 0.0
+            objective = prior_objective
+        profile = NxMProfileResult(
+            shape_coefficients=coefficients[None, :],
+            residual_objective=float(residual_objective),
+            prior_objective=float(prior_objective),
+            objective=float(objective),
+        )
+        gradient = np.array([amplitude_gradient, delay_gradient], dtype=float)
+        return profile, gradient
+
+
+@dataclass(frozen=True)
+class _SingleChannelCache:
+    """Delay-invariant template terms shared by all traces in a 1xM fit."""
+
+    angular_frequencies: FloatArray
+    basis_gram: FloatArray
+    basis_mean: FloatArray
+    identity: FloatArray
+    projection_kernels: ComplexArray
+    spectral_precision: FloatArray
+    rfft_multiplicity: FloatArray
+    mean_gram: float
+    n_samples: int
+
+    def prepare(self, trace_fft: ComplexArray) -> _SingleChannelWorkspace:
+        """Create trace-dependent sufficient statistics.
+
+        Args:
+            trace_fft: Selected trace spectrum with shape
+                ``(n_frequencies, 1)``.
+
+        Returns:
+            Workspace for exact free-delay evaluations.
+        """
+
+        trace_spectrum = trace_fft[:, 0]
+        projection_spectra = self.projection_kernels * trace_spectrum[:, None]
+        data_objective = float(
+            np.sum(self.spectral_precision * np.abs(trace_spectrum) ** 2)
+        )
+        return _SingleChannelWorkspace(
+            angular_frequencies=self.angular_frequencies,
+            basis_gram=self.basis_gram,
+            basis_mean=self.basis_mean,
+            identity=self.identity,
+            projection_spectra=projection_spectra,
+            rfft_multiplicity=self.rfft_multiplicity,
+            mean_gram=self.mean_gram,
+            data_objective=data_objective,
+            n_samples=self.n_samples,
+        )
+
+
 def estimate_csd(
     noise_traces: ArrayLike,
     detrend: str | bool | None = "constant",
@@ -404,6 +593,7 @@ class NxMReconstructor:
             selected_csd + np.swapaxes(selected_csd.conj(), -1, -2)
         )
         self.noise_csd, self.inverse_noise_csd = self._condition_csd(selected_csd)
+        self._single_channel_cache = self._prepare_single_channel_cache()
 
     def _condition_csd(self, csd: ComplexArray) -> tuple[ComplexArray, ComplexArray]:
         """Condition and invert every frequency bin used by the likelihood."""
@@ -431,6 +621,56 @@ class NxMReconstructor:
             eigenvectors * (1.0 / clipped)[:, None, :]
         ) @ eigenvectors_h
         return conditioned, inverse
+
+    def _prepare_single_channel_cache(self) -> _SingleChannelCache | None:
+        """Precompute delay-invariant 1xM template terms.
+
+        Returns:
+            A reusable cache for a single-channel reconstructor, or ``None``
+            for the general multi-channel case.
+        """
+
+        if self.n_channels != 1:
+            return None
+
+        spectral_precision = (
+            self._likelihood_weights * self.inverse_noise_csd[:, 0, 0].real
+        )
+        mean_spectrum = self._mean_fft[:, 0]
+        basis_spectra = self._basis_fft[:, 0, :]
+        template_spectra = np.column_stack((mean_spectrum, basis_spectra))
+        projection_kernels = (
+            spectral_precision[:, None] * template_spectra.conj()
+        )
+        mean_gram = float(
+            np.sum(spectral_precision * np.abs(mean_spectrum) ** 2)
+        )
+        if self.n_modes:
+            basis_gram = np.real(
+                basis_spectra.conj().T
+                @ (spectral_precision[:, None] * basis_spectra)
+            )
+            basis_gram = 0.5 * (basis_gram + basis_gram.T)
+            basis_mean = np.real(
+                basis_spectra.conj().T
+                @ (spectral_precision * mean_spectrum)
+            )
+        else:
+            basis_gram = np.empty((0, 0), dtype=float)
+            basis_mean = np.empty(0, dtype=float)
+        return _SingleChannelCache(
+            angular_frequencies=self._angular_frequencies,
+            basis_gram=np.asarray(basis_gram, dtype=float),
+            basis_mean=np.asarray(basis_mean, dtype=float),
+            identity=np.eye(self.n_modes),
+            projection_kernels=np.asarray(
+                projection_kernels, dtype=np.complex128
+            ),
+            spectral_precision=np.asarray(spectral_precision, dtype=float),
+            rfft_multiplicity=self._rfft_multiplicity,
+            mean_gram=mean_gram,
+            n_samples=self.n_samples,
+        )
 
     def _validate_traces(self, traces: ArrayLike) -> FloatArray:
         """Return validated time-domain traces."""
@@ -930,6 +1170,44 @@ class NxMReconstructor:
         trace_values = self._validate_traces(traces)
         bounds = self._normalize_delay_bounds(delay_bounds)
         trace_fft = np.fft.rfft(trace_values, axis=-1).T[: self.frequency_limit]
+        single_channel_workspace = (
+            self._single_channel_cache.prepare(trace_fft)
+            if self._single_channel_cache is not None
+            else None
+        )
+        return self._initialize_fft(
+            trace_fft,
+            bounds,
+            single_channel_workspace=single_channel_workspace,
+        )
+
+    def _initialize_fft(
+        self,
+        trace_fft: ComplexArray,
+        bounds: FloatArray,
+        *,
+        single_channel_workspace: _SingleChannelWorkspace | None = None,
+    ) -> tuple[FloatArray, FloatArray]:
+        """Estimate initial parameters from an existing trace spectrum.
+
+        Args:
+            trace_fft: Selected trace spectrum with shape
+                ``(n_frequencies, n_channels)``.
+            bounds: Validated per-channel delay bounds.
+            single_channel_workspace: Optional cached 1xM trace terms.
+
+        Returns:
+            Tuple of nonnegative amplitudes and integer-valued delay estimates.
+
+        Raises:
+            ValueError: If a mean template has zero weighted norm.
+        """
+
+        if single_channel_workspace is not None:
+            return self._initialize_single_channel(
+                single_channel_workspace, bounds[0]
+            )
+
         amplitudes = np.zeros(self.n_channels, dtype=float)
         delays = np.zeros(self.n_channels, dtype=float)
 
@@ -972,6 +1250,50 @@ class NxMReconstructor:
 
         return amplitudes, delays
 
+    def _initialize_single_channel(
+        self,
+        workspace: _SingleChannelWorkspace,
+        bounds: FloatArray,
+    ) -> tuple[FloatArray, FloatArray]:
+        """Initialize a 1xM fit using inverse-FFT delay correlations.
+
+        Args:
+            workspace: Trace-dependent single-channel sufficient statistics.
+            bounds: Lower and upper delay bounds.
+
+        Returns:
+            One-element amplitude and delay arrays.
+
+        Raises:
+            ValueError: If the mean template has zero weighted norm.
+        """
+
+        lower, upper = bounds
+        integer_delays = np.arange(np.ceil(lower), np.floor(upper) + 1.0)
+        if integer_delays.size:
+            all_responses = workspace.integer_delay_correlations()
+            wrapped_indices = np.remainder(
+                integer_delays.astype(np.int64), self.n_samples
+            )
+            responses = all_responses[wrapped_indices]
+        else:
+            integer_delays = np.array([(lower + upper) / 2.0])
+            correlations, _ = workspace.correlations(float(integer_delays[0]))
+            responses = correlations[:1]
+
+        denominator = workspace.mean_gram
+        if not np.isfinite(denominator) or denominator <= 0.0:
+            raise ValueError("mean template for channel 0 has zero weighted norm")
+        positive_responses = np.maximum(responses, 0.0)
+        scores = positive_responses**2 / denominator
+        best = int(np.argmax(scores))
+        if scores[best] == 0.0:
+            target = np.clip(0.0, lower, upper)
+            best = int(np.argmin(np.abs(integer_delays - target)))
+        amplitudes = np.array([positive_responses[best] / denominator])
+        delays = np.array([integer_delays[best]])
+        return amplitudes, delays
+
     def fit(
         self,
         traces: ArrayLike,
@@ -1005,7 +1327,8 @@ class NxMReconstructor:
             optimizer_options: Options passed to SciPy's optimizer.
             method: Optimization method passed to
                 :func:`scipy.optimize.minimize`. ``None`` selects L-BFGS-B for
-                fixed delays and Powell when delays are fitted.
+                fixed delays and for free-delay single-channel fits, and
+                Powell for free-delay multi-channel fits.
 
         Returns:
             Fitted parameters and diagnostics.
@@ -1016,11 +1339,21 @@ class NxMReconstructor:
 
         trace_values = self._validate_traces(traces)
         trace_fft = np.fft.rfft(trace_values, axis=-1).T[: self.frequency_limit]
+        single_channel_workspace = (
+            self._single_channel_cache.prepare(trace_fft)
+            if self._single_channel_cache is not None
+            else None
+        )
 
         # Fill missing initial amplitudes or delays with matched-filter estimates.
         if initial_amplitudes is None or initial_delays is None:
-            estimated_amplitudes, estimated_delays = self.initialize(
-                trace_values, delay_bounds=initialization_bounds
+            initialization_delay_bounds = self._normalize_delay_bounds(
+                initialization_bounds
+            )
+            estimated_amplitudes, estimated_delays = self._initialize_fft(
+                trace_fft,
+                initialization_delay_bounds,
+                single_channel_workspace=single_channel_workspace,
             )
         else:
             estimated_amplitudes = np.empty(0)
@@ -1073,17 +1406,34 @@ class NxMReconstructor:
             if fix_delay
             else None
         )
+        free_delay_single_channel_workspace = (
+            single_channel_workspace if not fix_delay else None
+        )
 
-        selected_method = method or ("L-BFGS-B" if fix_delay else "Powell")
+        selected_method = method or (
+            "L-BFGS-B"
+            if fix_delay or free_delay_single_channel_workspace is not None
+            else "Powell"
+        )
         gradient_methods = {"bfgs", "cg", "l-bfgs-b", "slsqp", "tnc"}
         use_analytic_gradient = (
-            fix_delay and selected_method.lower() in gradient_methods
+            (fix_delay or free_delay_single_channel_workspace is not None)
+            and selected_method.lower() in gradient_methods
         )
 
         def objective(
             parameters: FloatArray,
         ) -> float | tuple[float, FloatArray]:
-            if not fix_delay:
+            if free_delay_single_channel_workspace is not None:
+                if use_analytic_gradient:
+                    profile, gradient = (
+                        free_delay_single_channel_workspace.evaluate_with_gradient(
+                            parameters
+                        )
+                    )
+                    return profile.objective, gradient
+                profile = free_delay_single_channel_workspace.evaluate(parameters)
+            elif not fix_delay:
                 profile, _ = self._profile_fft(
                     trace_fft,
                     parameters[: self.n_channels],
@@ -1110,8 +1460,16 @@ class NxMReconstructor:
             }
         elif selected_method.lower() == "l-bfgs-b":
             options = {
-                "ftol": 1e-9,
-                "gtol": 1e-3,
+                "ftol": (
+                    1e-10
+                    if free_delay_single_channel_workspace is not None
+                    else 1e-9
+                ),
+                "gtol": (
+                    1e-4
+                    if free_delay_single_channel_workspace is not None
+                    else 1e-3
+                ),
                 "maxiter": 500,
                 "maxfun": 5000,
                 "maxls": 50,
@@ -1137,7 +1495,11 @@ class NxMReconstructor:
             if not fix_delay
             else delays
         )
-        if fixed_delay_workspace is None:
+        if free_delay_single_channel_workspace is not None:
+            fitted_profile = free_delay_single_channel_workspace.evaluate(
+                np.concatenate((fitted_amplitudes, fitted_delays))
+            )
+        elif fixed_delay_workspace is None:
             fitted_profile, _ = self._profile_fft(
                 trace_fft, fitted_amplitudes, fitted_delays
             )

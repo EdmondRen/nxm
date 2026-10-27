@@ -7,6 +7,7 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
+import nxm as nxm_module
 from nxm import NxMFitResult, NxMReconstructor, estimate_csd
 
 
@@ -465,6 +466,195 @@ def test_automatic_fixed_delay_optimizer_matches_powell() -> None:
     )
     assert automatic.objective == pytest.approx(
         powell.objective, rel=1e-9, abs=1e-8
+    )
+
+
+@pytest.mark.parametrize("n_modes", [0, 2])
+def test_single_channel_workspace_matches_profile_and_gradient(
+    n_modes: int,
+) -> None:
+    """The free-delay 1xM cache should preserve the exact profile objective."""
+
+    reconstructor, _, _, _ = make_problem(
+        n_channels=1, n_modes=n_modes, n_samples=128
+    )
+    rng = np.random.default_rng(210 + n_modes)
+    traces = rng.normal(scale=0.01, size=(1, 128))
+    trace_fft = np.fft.rfft(traces, axis=-1).T[
+        : reconstructor.frequency_limit
+    ]
+    cache = reconstructor._single_channel_cache
+    assert cache is not None
+    workspace = cache.prepare(trace_fft)
+    parameters = np.array([1.3, 1.75])
+
+    expected, _ = reconstructor._profile_fft(
+        trace_fft, parameters[:1], parameters[1:]
+    )
+    actual, analytic_gradient = workspace.evaluate_with_gradient(parameters)
+
+    np.testing.assert_allclose(
+        actual.shape_coefficients,
+        expected.shape_coefficients,
+        rtol=1e-11,
+        atol=1e-11,
+    )
+    assert actual.residual_objective == pytest.approx(
+        expected.residual_objective, rel=1e-11, abs=1e-8
+    )
+    assert actual.prior_objective == pytest.approx(
+        expected.prior_objective, rel=1e-11, abs=1e-10
+    )
+    assert actual.objective == pytest.approx(
+        expected.objective, rel=1e-11, abs=1e-8
+    )
+
+    finite_difference = np.empty(2)
+    steps = np.array([1e-6, 1e-5])
+    for index, step in enumerate(steps):
+        offset = np.zeros(2)
+        offset[index] = step
+        upper = workspace.evaluate(parameters + offset).objective
+        lower = workspace.evaluate(parameters - offset).objective
+        finite_difference[index] = (upper - lower) / (2.0 * step)
+    np.testing.assert_allclose(
+        analytic_gradient, finite_difference, rtol=3e-5, atol=1e-4
+    )
+
+
+def test_free_delay_single_channel_fit_uses_cache_and_lbfgsb(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Automatic 1xM fits should avoid the general profiler and use gradients."""
+
+    reconstructor, means, components, variances = make_problem(
+        n_channels=1, n_modes=1, n_samples=128
+    )
+    traces = synthesize(
+        means,
+        components,
+        variances,
+        np.array([1.8]),
+        np.array([1.4]),
+        np.array([[0.25]]),
+    )
+
+    def fail_reference_profile(*args: object, **kwargs: object) -> None:
+        """Fail if the general frequency profiler is evaluated."""
+
+        raise AssertionError("free-delay 1xM fit used the general profile path")
+
+    selected: dict[str, object] = {}
+    original_minimize = nxm_module.optimize.minimize
+
+    def record_minimize(*args: object, **kwargs: object) -> object:
+        """Record optimizer selection before delegating to SciPy."""
+
+        selected["method"] = kwargs.get("method")
+        selected["jac"] = kwargs.get("jac")
+        return original_minimize(*args, **kwargs)
+
+    monkeypatch.setattr(reconstructor, "_profile_fft", fail_reference_profile)
+    monkeypatch.setattr(nxm_module.optimize, "minimize", record_minimize)
+    result = reconstructor.fit(
+        traces,
+        initial_amplitudes=np.array([1.5]),
+        initial_delays=np.array([1.0]),
+        delay_half_width=2.0,
+    )
+
+    assert selected == {"method": "L-BFGS-B", "jac": True}
+    assert result.success, result.message
+    assert result.amplitudes[0] == pytest.approx(1.8, rel=0.02)
+    assert result.delays[0] == pytest.approx(1.4, abs=0.15)
+
+
+def test_automatic_single_channel_optimizer_matches_powell() -> None:
+    """Gradient-based 1xM fitting should agree with a tight Powell reference."""
+
+    reconstructor, means, components, variances = make_problem(
+        n_channels=1, n_modes=2, n_samples=128
+    )
+    traces = synthesize(
+        means,
+        components,
+        variances,
+        np.array([2.1]),
+        np.array([1.65]),
+        np.array([[0.3, -0.2]]),
+    )
+    fit_arguments = {
+        "initial_amplitudes": np.array([1.7]),
+        "initial_delays": np.array([1.0]),
+        "delay_half_width": 2.0,
+    }
+    automatic = reconstructor.fit(traces, **fit_arguments)
+    powell = reconstructor.fit(
+        traces,
+        **fit_arguments,
+        method="Powell",
+        optimizer_options={"xtol": 1e-8, "ftol": 1e-11},
+    )
+
+    assert automatic.success, automatic.message
+    assert powell.success, powell.message
+    np.testing.assert_allclose(
+        automatic.amplitudes, powell.amplitudes, rtol=2e-5, atol=1e-7
+    )
+    np.testing.assert_allclose(
+        automatic.delays, powell.delays, rtol=0.0, atol=2e-5
+    )
+    assert automatic.objective == pytest.approx(
+        powell.objective, rel=3e-7, abs=5e-8
+    )
+
+
+@pytest.mark.parametrize("n_samples", [63, 64])
+def test_single_channel_fft_initialization_matches_direct_search(
+    n_samples: int,
+) -> None:
+    """Inverse-FFT initialization should match direct integer-delay filters."""
+
+    reconstructor, _, _, _ = make_problem(
+        n_channels=1, n_modes=1, n_samples=n_samples
+    )
+    rng = np.random.default_rng(300 + n_samples)
+    traces = rng.normal(scale=0.01, size=(1, n_samples))
+    bounds = np.array([-9.0, 7.0])
+    actual_amplitudes, actual_delays = reconstructor.initialize(traces, bounds)
+
+    trace_fft = np.fft.rfft(traces, axis=-1).T[
+        : reconstructor.frequency_limit
+    ]
+    integer_delays = np.arange(bounds[0], bounds[1] + 1.0)
+    phase = np.exp(
+        -1j
+        * reconstructor._angular_frequencies[:, None]
+        * integer_delays[None, :]
+    )
+    shifted_template = reconstructor._mean_fft[:, 0, None] * phase
+    precision = np.zeros(reconstructor.frequency_limit)
+    active = reconstructor._likelihood_weights > 0.0
+    precision[active] = 1.0 / reconstructor.noise_csd[active, 0, 0].real
+    weighted = reconstructor._likelihood_weights * precision
+    denominator = np.sum(
+        weighted * np.abs(reconstructor._mean_fft[:, 0]) ** 2
+    )
+    responses = np.sum(
+        weighted[:, None]
+        * np.real(shifted_template.conj() * trace_fft[:, 0, None]),
+        axis=0,
+    )
+    positive_responses = np.maximum(responses, 0.0)
+    scores = positive_responses**2 / denominator
+    best = int(np.argmax(scores))
+    if scores[best] == 0.0:
+        target = np.clip(0.0, bounds[0], bounds[1])
+        best = int(np.argmin(np.abs(integer_delays - target)))
+
+    assert actual_delays[0] == integer_delays[best]
+    assert actual_amplitudes[0] == pytest.approx(
+        positive_responses[best] / denominator, rel=1e-12, abs=1e-14
     )
 
 

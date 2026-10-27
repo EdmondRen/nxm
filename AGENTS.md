@@ -15,6 +15,7 @@ There is no package build, dependency manifest, or automated test suite yet. Wor
 
 - `jupyter lab` opens the notebooks for interactive development.
 - `python -m py_compile _config.py` performs a quick syntax check of the shared configuration.
+- `python -m pytest` runs the test suite with the active Python interpreter. Always use this module form instead of the bare `pytest` command: the executable found on `PATH` may use `/usr/bin/python3` rather than the active virtual environment and fail to import dependencies such as `exceptiongroup`.
 - `jupyter nbconvert --to notebook --execute notebooks/1.nxm_dev.ipynb --output /tmp/nxm_dev.ipynb` smoke-tests a notebook without replacing the tracked copy. It requires valid data paths and locally available project dependencies.
 
 ## Coding Style & Naming Conventions
