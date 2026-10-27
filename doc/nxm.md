@@ -112,7 +112,7 @@ A_J\mathbf s_{0,J}(t_J)
 \end{pmatrix},
 \qquad
 D(\mathbf A,\mathbf t)=
-\operatorname{blockdiag}\!\left[
+\mathrm{blockdiag}\!\left[
 A_1\mathbf B_1(t_1),\ldots,A_J\mathbf B_J(t_J)
 \right].
 $$
@@ -166,21 +166,35 @@ $$
 where $w_l$ contains the chosen FFT and one-sided-spectrum normalization. Equivalently,
 
 $$
-H=I_{JK}+\sum_l w_l\operatorname{Re}
+H=I_{JK}+\sum_l w_l\mathrm{Re}
 \left(\widetilde D_l^\dagger S_l^{-1}\widetilde D_l\right),
 \qquad
-\mathbf g=\sum_l w_l\operatorname{Re}
+\mathbf g=\sum_l w_l\mathrm{Re}
 \left[\widetilde D_l^\dagger S_l^{-1}
 (\widetilde{\mathbf x}_l-\widetilde{\boldsymbol\mu}_l)\right],
 $$
 
 and $\widehat{\mathbf z}=H^{-1}\mathbf g$. Data, templates, and CSDs must use identical FFT normalization, sampling rate, trace length, and channel ordering. After baseline subtraction, omit the DC bin.
 
-The implementation in `src/nxm.py` uses raw NumPy RFFT covariance,
-$S_l=\mathbb E[\widetilde{\mathbf x}_l\widetilde{\mathbf x}_l^\dagger]$,
-rather than power-density units. It assigns weight 2 to bins with a distinct
-negative-frequency partner, weight 1 to the Nyquist bin, and weight 0 to DC.
-Delays are fractional sample offsets relative to the unshifted templates.
+The implementation in `src/nxm.py` uses one-sided CSD power density at sampling
+frequency $f_s=1$. If
+$C_l=\mathbb E[\widetilde{\mathbf x}_l\widetilde{\mathbf x}_l^\dagger]$
+is the raw NumPy RFFT covariance and $m_l$ is 2 for an interior bin and 1 for
+DC or Nyquist, the required input is
+
+$$
+S_l=\frac{m_l}{N}C_l.
+$$
+
+Thus the likelihood multiplier used with $S_l^{-1}$ is $m_l^2/N$. DC receives
+zero likelihood weight when omitted. The real-data DOF count still uses
+$m_l$, because an interior complex coefficient represents two real
+constraints. Delays are fractional sample offsets relative to the unshifted
+templates.
+
+Legacy raw-covariance inputs must be multiplied by $m_l/N$. The repository's
+older `csd_matrices` artifacts already contain the one-sided multiplicity but
+not the density normalization, so divide those arrays by the trace length.
 
 For a result returned by `fit`, call
 `reconstructor.reduced_chi_square(result)`. The implementation derives the
@@ -198,7 +212,7 @@ $$
 T=(G+P)^+G,
 \qquad
 \nu_{\mathrm{eff}}
-=N_{\mathrm{data}}-2\operatorname{tr}(T)+\operatorname{tr}(T^2).
+=N_{\mathrm{data}}-2\mathrm{tr}(T)+\mathrm{tr}(T^2).
 $$
 
 Then `reduced_chi_square(result)` returns
@@ -206,10 +220,10 @@ $Q_{\mathrm{residual}}/\nu_{\mathrm{eff}}`. This is a local-linear effective
 DOF calculation for the nonlinear fit. For comparison,
 `reduced_chi_square(result, dof_method="nominal")` subtracts the numerical rank
 of the active Jacobian instead. Neither convention can compensate for an
-incorrectly normalized CSD: values near one require the raw NumPy RFFT
-covariance convention used by `estimate_csd`.
+incorrectly normalized CSD: values near one require the one-sided density
+convention returned by `estimate_csd`.
 
-Before inversion, symmetrize each estimated CSD as $(S_l+S_l^\dagger)/2$. If $S_l=U\operatorname{diag}(d_q)U^\dagger$, replace
+Before inversion, symmetrize each estimated CSD as $(S_l+S_l^\dagger)/2$. If $S_l=U\mathrm{diag}(d_q)U^\dagger$, replace
 
 $$
 d_q\longrightarrow\max(d_q,\epsilon_{\mathrm{CSD}}d_{\max})
@@ -237,7 +251,7 @@ Run a linear mean-template optimal filter to obtain initial $A_j$ and $t_j$ for 
 
 ### 3.4 Joint profiled fit
 
-For each trial $(\mathbf A,\mathbf t)$, construct $\widetilde{\boldsymbol\mu}_l$ and $\widetilde D_l$, solve $H\widehat{\mathbf z}=\mathbf g$, and evaluate $Q_{\mathrm{prof}}=Q(\mathbf A,\mathbf t,\widehat{\mathbf z})$. Minimize this objective with bounds $A_j\geq0$ and the configured timing intervals.
+For each trial $(\mathbf A,\mathbf t),$ construct $\widetilde{\boldsymbol\mu}_l$ and $\widetilde D_l$ , solve $H\widehat{\mathbf z}=\mathbf g,$ and evaluate $Q_{\mathrm{prof}}=Q(\mathbf A,\mathbf t,\widehat{\mathbf z}).$ Minimize this objective with bounds $A_j\geq0$ and the configured timing intervals.
 
 When delays are fixed, their phases and all frequency-summed template, data,
 and CSD contractions are constant during the outer fit. The implementation
@@ -245,6 +259,11 @@ precomputes these sufficient statistics once and evaluates subsequent trial
 amplitudes using only small channel/mode matrices. This is algebraically
 equivalent to the frequency-bin calculation; caching shifted templates alone
 would leave the dominant frequency contractions inside every objective call.
+The cached objective also supplies an analytic amplitude gradient. Unless an
+optimizer is selected explicitly, fixed-delay fits use bounded L-BFGS-B while
+fits with free delays continue to use Powell. Degrees-of-freedom diagnostics
+are computed lazily so their local-Jacobian contraction does not slow fits that
+do not request reduced chi-square.
 
 Store $\widehat{\mathbf A}$, $\widehat{\mathbf t}$, $\widehat{\mathbf z}$, the noise-residual term, the PCA-prior term, the total objective, optimizer status, and any active bounds. Large $|z_k|$, structured whitened residuals, or repeated boundary hits indicate template mismatch or a failed fit. Validate the workflow with held-out pulses, noise-only traces, and simulated pulse injections before applying it to physics data.
 

@@ -23,7 +23,8 @@ def make_problem(
         n_channels: Number of synthetic channels.
         n_modes: Number of PCA modes per channel.
         n_samples: Trace length.
-        noise_scale: Scale of the raw RFFT covariance.
+        noise_scale: Scale of the raw RFFT covariance before conversion to
+            one-sided density.
 
     Returns:
         Reconstructor, mean templates, PCA components, and variances.
@@ -69,11 +70,16 @@ def make_problem(
     variances = np.full((n_channels, n_modes), 0.04)
     correlation = np.full((n_channels, n_channels), 0.2)
     np.fill_diagonal(correlation, 1.0)
-    csd = np.repeat(
+    raw_csd = np.repeat(
         (noise_scale * correlation)[None, :, :],
         n_samples // 2 + 1,
         axis=0,
     ).astype(complex)
+    multiplicity = np.full(n_samples // 2 + 1, 2.0)
+    multiplicity[0] = 1.0
+    if n_samples % 2 == 0:
+        multiplicity[-1] = 1.0
+    csd = raw_csd * multiplicity[:, None, None] / n_samples
     reconstructor = NxMReconstructor(
         means_array,
         components_array,
@@ -148,7 +154,7 @@ def make_result(
 
 
 def test_estimate_csd_recovers_correlated_white_noise() -> None:
-    """Raw RFFT covariance should approach n_samples times time covariance."""
+    """One-sided density should double interior white-noise covariance."""
 
     rng = np.random.default_rng(20261023)
     n_events, n_samples = 3000, 16
@@ -162,10 +168,12 @@ def test_estimate_csd_recovers_correlated_white_noise() -> None:
     np.testing.assert_allclose(csd, np.swapaxes(csd.conj(), -1, -2))
     np.testing.assert_allclose(
         np.mean(csd[1:-1], axis=0).real,
-        n_samples * covariance,
+        2.0 * covariance,
         rtol=0.05,
         atol=0.15,
     )
+    np.testing.assert_allclose(csd[0].real, covariance, rtol=0.06, atol=0.15)
+    np.testing.assert_allclose(csd[-1].real, covariance, rtol=0.06, atol=0.15)
 
 
 def test_csd_eigenvalue_floor_conditions_singular_bins() -> None:
@@ -293,7 +301,35 @@ def test_profile_uses_off_diagonal_csd_terms() -> None:
         "fjm,fm->fj", reconstructor.inverse_noise_csd, spectrum
     )
     expected = np.sum(
-        reconstructor._weights[:, None]
+        reconstructor._likelihood_weights[:, None]
+        * np.real(spectrum.conj() * weighted)
+    )
+
+    assert profile.residual_objective == pytest.approx(expected)
+
+
+def test_one_sided_density_matches_raw_covariance_likelihood() -> None:
+    """Density and converted raw covariance should define the same chi-square."""
+
+    reconstructor, _, _, _ = make_problem(n_modes=0)
+    rng = np.random.default_rng(101)
+    traces = rng.normal(size=(reconstructor.n_channels, reconstructor.n_samples))
+    spectrum = np.fft.rfft(traces, axis=-1).T[: reconstructor.frequency_limit]
+    profile = reconstructor.profile(
+        traces,
+        np.zeros(reconstructor.n_channels),
+        np.zeros(reconstructor.n_channels),
+    )
+
+    raw_csd = (
+        reconstructor.noise_csd
+        * reconstructor.n_samples
+        / reconstructor._rfft_multiplicity[:, None, None]
+    )
+    raw_inverse = np.linalg.inv(raw_csd)
+    weighted = np.einsum("fjm,fm->fj", raw_inverse, spectrum)
+    expected = np.sum(
+        reconstructor._data_weights[:, None]
         * np.real(spectrum.conj() * weighted)
     )
 
@@ -331,6 +367,33 @@ def test_fixed_delay_workspace_matches_frequency_profile(n_modes: int) -> None:
     )
 
 
+@pytest.mark.parametrize("n_modes", [0, 2])
+def test_fixed_delay_gradient_matches_central_difference(n_modes: int) -> None:
+    """The cached analytic amplitude gradient should match finite differences."""
+
+    reconstructor, _, _, _ = make_problem(
+        n_channels=3, n_modes=n_modes, n_samples=128
+    )
+    rng = np.random.default_rng(70 + n_modes)
+    traces = rng.normal(scale=0.01, size=(3, 128))
+    trace_fft = np.fft.rfft(traces, axis=-1).T[: reconstructor.frequency_limit]
+    amplitudes = np.array([0.7, 1.1, 1.6])
+    delays = np.array([0.4, -1.2, 2.3])
+    workspace = reconstructor._prepare_fixed_delay_workspace(trace_fft, delays)
+
+    _, analytic = workspace.evaluate_with_gradient(amplitudes)
+    finite_difference = np.empty_like(amplitudes)
+    step = 1e-6
+    for channel in range(reconstructor.n_channels):
+        offset = np.zeros_like(amplitudes)
+        offset[channel] = step
+        upper = workspace.evaluate(amplitudes + offset).objective
+        lower = workspace.evaluate(amplitudes - offset).objective
+        finite_difference[channel] = (upper - lower) / (2.0 * step)
+
+    np.testing.assert_allclose(analytic, finite_difference, rtol=2e-5, atol=1e-4)
+
+
 def test_fixed_delay_fit_automatically_uses_workspace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -346,6 +409,9 @@ def test_fixed_delay_fit_automatically_uses_workspace(
         raise AssertionError("fixed-delay fit used the general profile path")
 
     monkeypatch.setattr(reconstructor, "_profile_fft", fail_reference_profile)
+    monkeypatch.setattr(
+        reconstructor, "_local_parameter_gram", fail_reference_profile
+    )
     result = reconstructor.fit(
         means,
         fix_delay=True,
@@ -357,6 +423,49 @@ def test_fixed_delay_fit_automatically_uses_workspace(
     assert result.delays_fitted is False
     assert np.all(np.isfinite(result.amplitudes))
     assert np.isfinite(result.objective)
+
+
+def test_automatic_fixed_delay_optimizer_matches_powell() -> None:
+    """Automatic L-BFGS-B should reach the same profiled solution as Powell."""
+
+    reconstructor, means, components, variances = make_problem(
+        n_channels=2, n_modes=1, n_samples=128
+    )
+    true_amplitudes = np.array([1.8, 2.4])
+    delays = np.array([1.5, -0.75])
+    coefficients = np.array([[0.3], [-0.2]])
+    traces = synthesize(
+        means,
+        components,
+        variances,
+        true_amplitudes,
+        delays,
+        coefficients,
+    )
+    initial_amplitudes = np.array([1.5, 2.1])
+    automatic = reconstructor.fit(
+        traces,
+        fix_delay=True,
+        initial_amplitudes=initial_amplitudes,
+        initial_delays=delays,
+    )
+    powell = reconstructor.fit(
+        traces,
+        fix_delay=True,
+        initial_amplitudes=initial_amplitudes,
+        initial_delays=delays,
+        method="Powell",
+        optimizer_options={"xtol": 1e-7, "ftol": 1e-10},
+    )
+
+    assert automatic.success, automatic.message
+    assert powell.success, powell.message
+    np.testing.assert_allclose(
+        automatic.amplitudes, powell.amplitudes, rtol=1e-5, atol=1e-7
+    )
+    assert automatic.objective == pytest.approx(
+        powell.objective, rel=1e-9, abs=1e-8
+    )
 
 
 def test_reduced_chi_square_uses_selected_real_frequency_constraints() -> None:
@@ -408,8 +517,8 @@ def test_data_dof_handles_odd_lengths_and_nyquist(
     )
 
 
-def test_raw_rfft_noise_has_unit_mean_reduced_chi_square() -> None:
-    """Independent raw-RFFT noise objectives should average to reduced chi2 one."""
+def test_one_sided_csd_noise_has_unit_mean_reduced_chi_square() -> None:
+    """Noise drawn from the input density should have reduced chi2 near one."""
 
     reconstructor, _, _, _ = make_problem(
         n_channels=1,
@@ -420,17 +529,22 @@ def test_raw_rfft_noise_has_unit_mean_reduced_chi_square() -> None:
     rng = np.random.default_rng(8675309)
     event_count = 2000
     active_bin_count = reconstructor.frequency_limit - 1
-    variance = reconstructor.noise_csd[1:, 0, 0].real
+    density = reconstructor.noise_csd[1:, 0, 0].real
+    raw_variance = (
+        density
+        * reconstructor.n_samples
+        / reconstructor._rfft_multiplicity[1:]
+    )
     spectra = np.empty((event_count, active_bin_count), dtype=complex)
     spectra[:, :-1] = (
         rng.normal(size=(event_count, active_bin_count - 1))
         + 1j * rng.normal(size=(event_count, active_bin_count - 1))
-    ) * np.sqrt(variance[:-1] / 2.0)[None, :]
-    spectra[:, -1] = rng.normal(size=event_count) * np.sqrt(variance[-1])
+    ) * np.sqrt(raw_variance[:-1] / 2.0)[None, :]
+    spectra[:, -1] = rng.normal(size=event_count) * np.sqrt(raw_variance[-1])
     objectives = np.sum(
-        reconstructor._weights[None, 1:]
+        reconstructor._likelihood_weights[None, 1:]
         * np.abs(spectra) ** 2
-        / variance[None, :],
+        / density[None, :],
         axis=1,
     )
     result = make_result(
@@ -467,7 +581,7 @@ def test_effective_dof_fractionally_counts_regularized_pca_mode() -> None:
     assert gram.shape == (1, 1)
     assert prior[0] == pytest.approx(1.0)
     shrinkage = gram[0, 0] / (gram[0, 0] + 1.0)
-    data_dof = float(np.sum(reconstructor._weights))
+    data_dof = float(np.sum(reconstructor._data_weights))
     expected_effective = data_dof - 2.0 * shrinkage + shrinkage**2
 
     assert reconstructor.degrees_of_freedom(
@@ -495,7 +609,7 @@ def test_degrees_of_freedom_excludes_fixed_and_bound_outer_parameters() -> None:
         fixed,
         amplitude_at_bound=np.array([True, False]),
     )
-    data_dof = 2.0 * np.sum(reconstructor._weights)
+    data_dof = 2.0 * np.sum(reconstructor._data_weights)
 
     assert reconstructor.degrees_of_freedom(
         fixed, method="nominal"
