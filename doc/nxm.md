@@ -111,17 +111,17 @@ initialization obtains all circular delay responses with one inverse FFT.
 
 For $J$ channels, let channel $j$ have data $\mathbf x_j$, amplitude $A_j\geq0$, delay $t_j$, mean template $\mathbf s_{0,j}$, PCA matrix $\mathbf B_j$, and standardized coefficients $\mathbf z_j$. Stack the channel data and coefficients as
 
-$$
+```math
 \mathbf x=
 \begin{pmatrix}\mathbf x_1\\ \vdots\\ \mathbf x_J\end{pmatrix},
 \qquad
 \mathbf z=
 \begin{pmatrix}\mathbf z_1\\ \vdots\\ \mathbf z_J\end{pmatrix}.
-$$
+```
 
 Define
 
-$$
+```math
 \boldsymbol\mu(\mathbf A,\mathbf t)=
 \begin{pmatrix}
 A_1\mathbf s_{0,1}(t_1)\\ \vdots\\
@@ -132,7 +132,7 @@ D(\mathbf A,\mathbf t)=
 \mathrm{blockdiag}\left[
 A_1\mathbf B_1(t_1),\ldots,A_J\mathbf B_J(t_J)
 \right].
-$$
+```
 
 The full noise covariance $N\in\mathbb R^{JM\times JM}$ contains both within-channel and cross-channel covariance. With $W=N^{-1}$ and independent standard-normal PCA priors, the joint objective is
 
@@ -182,14 +182,14 @@ $$
 
 where $w_l$ contains the chosen FFT and one-sided-spectrum normalization. Equivalently,
 
-$$
+```math
 H=I_{JK}+\sum_l w_l\mathrm{Re}
 \left(\widetilde D_l^\dagger S_l^{-1}\widetilde D_l\right),
 \qquad
 \mathbf g=\sum_l w_l\mathrm{Re}
 \left[\widetilde D_l^\dagger S_l^{-1}
 (\widetilde{\mathbf x}_l-\widetilde{\boldsymbol\mu}_l)\right],
-$$
+```
 
 and $\widehat{\mathbf z}=H^{-1}\mathbf g$. Data, templates, and CSDs must use identical FFT normalization, sampling rate, trace length, and channel ordering. After baseline subtraction, omit the DC bin.
 
