@@ -83,7 +83,7 @@ Substitution gives the profiled objective
 
 $$
 Q_{\mathrm{prof}}(A,t_0)
-=Q\!\left(A,t_0,\widehat{\mathbf z}(A,t_0)\right),
+=Q\left(A,t_0,\widehat{\mathbf z}(A,t_0)\right),
 $$
 
 which is minimized numerically over $A\geq0$ and an allowed interval in $t_0$.
@@ -129,7 +129,7 @@ A_J\mathbf s_{0,J}(t_J)
 \end{pmatrix},
 \qquad
 D(\mathbf A,\mathbf t)=
-\mathrm{blockdiag}\!\left[
+\mathrm{blockdiag}\left[
 A_1\mathbf B_1(t_1),\ldots,A_J\mathbf B_J(t_J)
 \right].
 $$
@@ -233,7 +233,7 @@ T=(G+P)^+G,
 $$
 
 Then `reduced_chi_square(result)` returns
-$Q_{\mathrm{residual}}/\nu_{\mathrm{eff}}`. This is a local-linear effective
+$Q_{\mathrm{residual}}/\nu_{\mathrm{eff}}$. This is a local-linear effective
 DOF calculation for the nonlinear fit. For comparison,
 `reduced_chi_square(result, dof_method="nominal")` subtracts the numerical rank
 of the active Jacobian instead. Neither convention can compensate for an
@@ -268,7 +268,8 @@ Run a linear mean-template optimal filter to obtain initial $A_j$ and $t_j$ for 
 
 ### 3.4 Joint profiled fit
 
-For each trial $(\mathbf A,\mathbf t),$ construct $\widetilde{\boldsymbol\mu}_l$ and $\widetilde D_l$ , solve $H\widehat{\mathbf z}=\mathbf g,$ and evaluate $Q_{\mathrm{prof}}=Q(\mathbf A,\mathbf t,\widehat{\mathbf z}).$ Minimize this objective with bounds $A_j\geq0$ and the configured timing intervals.
+For each trial $`(\mathbf A,\mathbf t)`$, construct $`\widetilde{\boldsymbol\mu}_l`$ and $`\widetilde D_l`$, solve $`H\widehat{\mathbf z}=\mathbf g`$, and evaluate $`Q_{\mathrm{prof}}=Q(\mathbf A,\mathbf t,\widehat{\mathbf z})`$. Minimize this objective with bounds $`A_j\geq 0`$ and the configured timing intervals.
+
 
 When delays are fixed, their phases and all frequency-summed template, data,
 and CSD contractions are constant during the outer fit. The implementation
