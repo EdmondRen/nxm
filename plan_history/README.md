@@ -5,3 +5,4 @@
 - 2026-10-27: [Optimize fixed-delay fits and correct reduced chi-square](20261027-101810-optimize-fixed-delay-and-chi-square.md)
 - 2026-10-27: [Adopt one-sided CSD density and further accelerate fits](20261027-114010-adopt-csd-density-and-accelerate-fit.md)
 - 2026-10-27: [Optimize free-delay 1xM reconstruction](20261027-145148-optimize-single-channel-free-delay.md)
+- 2026-10-28: [Revise the NxM reconstruction note](20261028-104927-revise-nxm-documentation.md)
