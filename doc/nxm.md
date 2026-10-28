@@ -1,17 +1,72 @@
-# Multi-channel, multi-template event reconstruction
+# Amplitude-dependent regularization for multi-channel, multi-template event reconstruction
 
 TES pulse shapes vary with event position and energy partition, while detector noise is correlated across channels. This workflow models scale-invariant pulse-shape variation with principal components and handles channel correlations with the full noise cross-spectral density (CSD).
 
+
 ## 1. Single-channel, multi-template reconstruction
 
-We first deal with pulse shape variation in a single channel by using a multi-template matched filter. The advantage over an analytical pulse shape fit is the robustness around threshold. Multi-template matched filter is well described in textbooks and we will skip the introduction. However, simply using PCA components as templates will give the wrong reconstruction. Cares must be taken in modeling the pulse and generating templates.
+We first deal with pulse shape variation in a single channel by using a multi-template matched filter. The advantage over an analytical pulse shape fit is the robustness around threshold, and fast computing time.
+
+Multi-template matched filter is well described in textbooks and we will skip the introduction. However, simply using PCA components as templates will give the wrong reconstruction. Cares must be taken in modeling the pulse and generating templates. An **unconstrained** fit works well at high signal-to-noise ratio [arxiv 2508.20090], but at low SNR the additional coefficients can follow noise fluctuations rather than genuine pulse-shape variations.
+
+
+### 1.1 Why the previous method fails
+
+The pulse model in the previous work is
+$$
+\mathbf x_i=
+A_i\mathbf s_0+\delta\mathbf s_0 + \boldsymbol\epsilon
+$$
+
+where $\mathbf s_0$ is the average pulse shape, and $\delta\mathbf s_0$ describe pulse shape variation.
+The fit model of the unconstrained workflow is 
+
+$$
+\mathbf x
+\approx
+\sum_{k=0}^K a_k\mathbf s_k,
+$$
+in which $\mathbf s_k$ are the pulse shape templates, $a_k$ are the amplitudes of each template. $\mathbf s_1,...\mathbf s_K$ are supposed to describe the pulse shape variation $\delta\mathbf s_0$. There are three major issues with this unconstrained fit workflow. 
+
+First, directly using PCA components as templates is a misconception. Standard PCA minimizes $\sum_i\|\mathbf x_i-\hat{\mathbf x}_i\|^2$ and gives the optimal affine rank-$K$ reconstruction:
+
+$$
+\hat{\mathbf x}=
+\bar{\mathbf x}
++
+P_KP_K^T(\mathbf x-\bar{\mathbf x}) 
+=\bar{\mathbf x}
++
+\sum_{k=1}^K a_{ik}\mathbf s_k.
+$$
+
+$\bar{\mathbf x}$ is the mean value of training samples. Without including $\bar{\mathbf x}$ in the fit model, then that is not the normal PCA reconstruction at all. One consequence is that the principle components will need to account for the missing $\bar{\mathbf x}$
+
+
+
+Second, the amplitude variation will mix the averaged pulse into the PCs.  If $A_i$ varies appreciably across the PCA training sample, direct PCA sees both amplitude variation and shape variation at once after subtracting $\bar{\mathbf x}$. The first PC will often be close to $\mathbf s_0$, but not exactly. If amplitude variation is correlated with pulse-shape variation, PCA produces rotated combinations such as So the first few PCs can easily be mixtures such as
+$$
+\mathbf p_1 \sim a_1\mathbf s_0+b_1\mathbf s_1+b_2\mathbf s_2, 
+$$
+$$
+\mathbf p_2 \sim a_2\mathbf s_0+c_1\mathbf s_1+c_2\mathbf s_2,
+$$
+etc., where $\mathbf q_k$ describe pulse-shape variations. 
+
+Mathematically, if we retain the full subspace, that rotation should not matter. But with only a few components, it can matter a lot because the optimal truncated subspace for total variance may not be the optimal truncated subspace for representing the pulse manifold locally.
+
+Third, there is no constraints on the amplitudes of each template. This will cause sever overfiting when the SNR is low. Each extra template introduces an additional degree of freedom. Even when the true pulse has no shape variation, noise will generally project onto the extra templates. Under the Gaussian-noise model, adding $K$ linearly independent unconstrained templates reduces the expected minimized $\chi^2$ by $K$ relative to the model without those templates, even when their true coefficients are zero. 
+
+A PCA basis identifies directions of variation in the training pulse population, but an unregularized fit does not use the PCA eigenvalues or any other information about **how probable** the corresponding coefficients are. 
+
+The third point needs modification to the pulse model, while the first two problems can be resolved by modifying the template generation procedure based on the new pulse model. 
+
+### 1.2 Pulse model for scale-invariant pulse shape variation
+
 
 We made the following assumptions to simplify the problem:
 1. Pulse shape fluctuation is scale invariant. We ignore the detector saturation effect for now.
 2. Noise is stationary but can be colored.
-
-
-### 1.1 Pulse model from PCA
 
 Let $\mathbf x\in\mathbb R^M$ be a baseline-subtracted pulse. The additive noise $\boldsymbol\epsilon$ has zero mean and covariance $N$, with $W=N^{-1}$. For approximately scale-invariant shape fluctuations, model the pulse as
 
@@ -43,9 +98,11 @@ $$
 }
 $$
 
+### 1.3 Template generation for this pulse model
+
 PCA must therefore be applied to amplitude-normalized residuals, not directly to unnormalized pulses. Otherwise the leading components mostly reproduce amplitude variation.
 
-### 1.2 MAP objective
+### 1.4 Maximum a posteriori (MAP) objective
 
 The negative twice log posterior, up to a constant, is
 
@@ -64,7 +121,7 @@ $$
 A\mathbf B^TW(\mathbf x-A\mathbf s_0).
 $$
 
-### 1.3 Pulse start time
+### 1.5 Pulse start time
 
 The above derivation assumes that templates and pulse data are already aligned in time. But in reality we don't know the pulse starting time.
 
