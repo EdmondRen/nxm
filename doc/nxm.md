@@ -358,20 +358,18 @@ $$
 where $\eta_l$ contains the chosen Fourier and one-sided-spectrum
 normalization. Equivalently, define
 
-$$
-H
-=I_{JK}+\sum_l\eta_l\mathrm{Re}\left(
+```math
+H=I_{JK}+\sum_l\eta_l\mathrm{Re}\left(
 \widetilde D_l^\dagger S_l^{-1}\widetilde D_l
 \right),
-$$
+```
 
-$$
-\mathbf g
-=\sum_l\eta_l\mathrm{Re}\left[
+```math
+\mathbf g=\sum_l\eta_l\mathrm{Re}\left[
 \widetilde D_l^\dagger S_l^{-1}
 (\widetilde{\mathbf x}_l-\widetilde{\boldsymbol\mu}_l)
 \right].
-$$
+```
 
 Then $\widehat{\mathbf z}=H^{-1}\mathbf g$. Data, templates, and CSDs must
 use the same sampling, trace length, channel ordering, and Fourier convention.
@@ -439,10 +437,10 @@ amplitudes to the nonnegative domain and restrict each final delay to a window
 around its initial value so that weak channels cannot move to unrelated noise
 fluctuations.
 
-For every trial set $(\mathbf A,\mathbf t)$, construct
-$\widetilde{\boldsymbol\mu}_l$ and $\widetilde D_l$, solve
-$H\widehat{\mathbf z}=\mathbf g$, and evaluate
-$Q_{\mathrm{prof}}=Q(\mathbf A,\mathbf t,\widehat{\mathbf z})$. Minimize the
+For every trial set $`(\mathbf A,\mathbf t)`$, construct
+$`\widetilde{\boldsymbol\mu}_l`$ and $`\widetilde D_l`$, solve
+$`H\widehat{\mathbf z}=\mathbf g`$, and evaluate
+$`Q_{\mathrm{prof}}=Q(\mathbf A,\mathbf t,\widehat{\mathbf z})`$. Minimize the
 profiled objective with $A_j\geq0$ and the configured delay bounds.
 
 Record the fitted amplitudes, delays, standardized PCA coefficients, residual
@@ -527,7 +525,8 @@ The implementation is provided by `src/nxm.py`:
 - `NxMReconstructor` validates and stores the mean templates, PCA directions,
   PCA variances, CSD, channel order, selected frequency range, and CSD floor.
 - `initialize` obtains nonnegative mean-template amplitude estimates and
-  integer delays.
+  integer delays. For best performance, however, use an analytical fit to obtain the initial delay, and use matched filter at the initial delay to estimate the mean-tempalte amplitude.
+- `profile` calculate the conditional estimation $\hat {\mathrm{\mathbf z}}(A, t)$ at given time and amplitudes.
 - `fit` profiles the PCA coefficients and optimizes the remaining amplitudes
   and, when requested, delays.
 - `reduced_chi_square` evaluates the residual objective with either effective
